@@ -4,19 +4,22 @@ use anyhow::{Context, Result};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Window, WindowBuilder};
-use wry::{NewWindowResponse, WebView, WebViewBuilder};
 #[cfg(target_os = "linux")]
 use wry::WebViewBuilderExtUnix;
+use wry::{NewWindowResponse, WebView, WebViewBuilder};
 
 #[cfg(target_os = "linux")]
 use tao::platform::unix::WindowExtUnix;
 
 use crate::config::AppConfig;
-use crate::ipc::{HostAction, HostEvent, StrategySelectionSnapshot, WaylandProfileSnapshot, build_emit_script, handle_frontend_message, init_script};
+use crate::ipc::{
+    HostAction, HostEvent, StrategySelectionSnapshot, WaylandProfileSnapshot, build_emit_script,
+    handle_frontend_message, init_script,
+};
 use crate::launcher;
 use crate::wayland::detect::WaylandProfile;
-use crate::wayland::engine::{PrototypeBackend, WindowInputBackend};
-use crate::wayland::input_region::{InputRegion, InteractiveRect};
+use crate::wayland::engine::{StrategySelection, apply_input_region_to_window, choose_strategy};
+use crate::wayland::input_region::InputRegion;
 
 #[derive(Debug, Clone)]
 enum UserEvent {
@@ -32,7 +35,10 @@ struct WindowEntry {
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
-    eprintln!("discovered N.E.K.O repo root: {}", config.repo_root.display());
+    eprintln!(
+        "discovered N.E.K.O repo root: {}",
+        config.repo_root.display()
+    );
     let launcher_runtime = launcher::start_launcher(&config.repo_root)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
     let frontend_url = frontend_ports
@@ -41,18 +47,11 @@ pub fn run(config: AppConfig) -> Result<()> {
     eprintln!("loading frontend url: {frontend_url}");
     let profile = WaylandProfile::detect();
     eprintln!("detected Wayland profile: {profile:#?}");
-    let mut input_backend = PrototypeBackend::new(&profile);
+    let strategy = choose_strategy(&profile);
     eprintln!(
         "selected window strategy: {:?} ({})",
-        input_backend.strategy().tier,
-        input_backend.strategy().reason
+        strategy.tier, strategy.reason
     );
-    input_backend.apply_input_region(&InputRegion::from_rects(vec![InteractiveRect {
-        x: 0,
-        y: 0,
-        width: 320,
-        height: 480,
-    }]))?;
 
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -63,18 +62,19 @@ pub fn run(config: AppConfig) -> Result<()> {
         &config.app_title,
         &frontend_url,
         &profile,
-        input_backend.strategy().clone(),
+        strategy.clone(),
     )?;
     let first_window_id = first_window.window.id();
     let mut windows = HashMap::new();
     windows.insert(first_window_id, first_window);
+    let mut current_input_region: Option<InputRegion> = None;
 
     let ready_event = HostEvent::Ready {
         profile: WaylandProfileSnapshot::from(&profile),
-        strategy: StrategySelectionSnapshot::from(input_backend.strategy()),
+        strategy: StrategySelectionSnapshot::from(&strategy),
     };
 
-    let _launcher_runtime = launcher_runtime;
+    let mut launcher_runtime = Some(launcher_runtime);
 
     event_loop.run(move |event, event_loop_window_target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -83,71 +83,91 @@ pub fn run(config: AppConfig) -> Result<()> {
             Event::NewEvents(StartCause::Init) => {
                 if let Some(entry) = windows.get(&first_window_id) {
                     let _ = entry.webview.evaluate_script(
-                        &build_emit_script(&ready_event)
-                            .unwrap_or_else(|_| "console.error('failed to emit ready event');".to_string()),
+                        &build_emit_script(&ready_event).unwrap_or_else(|_| {
+                            "console.error('failed to emit ready event');".to_string()
+                        }),
                     );
                 }
             }
-            Event::UserEvent(user_event) => {
-                match user_event {
-                    UserEvent::EmitToFrontend(host_event) => {
-                        if let Ok(script) = build_emit_script(&host_event) {
-                            for entry in windows.values() {
-                                let _ = entry.webview.evaluate_script(&script);
-                            }
+            Event::UserEvent(user_event) => match user_event {
+                UserEvent::EmitToFrontend(host_event) => {
+                    if let Ok(script) = build_emit_script(&host_event) {
+                        for entry in windows.values() {
+                            let _ = entry.webview.evaluate_script(&script);
                         }
-                    }
-                    UserEvent::ApplyInputRegion(region) => {
-                        let rect_count = region.rects().len();
-                        match input_backend.apply_input_region(&region) {
-                            Ok(()) => {
-                                if let Ok(script) = build_emit_script(&HostEvent::InputRegionApplied {
-                                    rect_count,
-                                }) {
-                                    for entry in windows.values() {
-                                        let _ = entry.webview.evaluate_script(&script);
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                if let Ok(script) = build_emit_script(&HostEvent::Error {
-                                    message: format!("failed to apply input region: {err}"),
-                                }) {
-                                    for entry in windows.values() {
-                                        let _ = entry.webview.evaluate_script(&script);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    UserEvent::OpenWindow(url) => {
-                        match create_window(
-                            event_loop_window_target,
-                            &proxy,
-                            &config.app_title,
-                            &url,
-                            &profile,
-                            input_backend.strategy().clone(),
-                        ) {
-                            Ok(entry) => {
-                                windows.insert(entry.window.id(), entry);
-                            }
-                            Err(err) => {
-                                if let Ok(script) = build_emit_script(&HostEvent::Error {
-                                    message: format!("failed to open new window: {err}"),
-                                }) {
-                                    for entry in windows.values() {
-                                        let _ = entry.webview.evaluate_script(&script);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    UserEvent::Terminate => {
-                        *control_flow = ControlFlow::Exit;
                     }
                 }
-            }
+                UserEvent::ApplyInputRegion(region) => {
+                    let rect_count = region.rects().len();
+                    let mut apply_error = None;
+
+                    for entry in windows.values() {
+                        if let Err(err) = apply_input_region_to_window(&entry.window, &region) {
+                            apply_error = Some(err);
+                            break;
+                        }
+                    }
+
+                    match apply_error {
+                        None => {
+                            current_input_region = Some(region);
+                            if let Ok(script) =
+                                build_emit_script(&HostEvent::InputRegionApplied { rect_count })
+                            {
+                                for entry in windows.values() {
+                                    let _ = entry.webview.evaluate_script(&script);
+                                }
+                            }
+                        }
+                        Some(err) => {
+                            if let Ok(script) = build_emit_script(&HostEvent::Error {
+                                message: format!("failed to apply input region: {err}"),
+                            }) {
+                                for entry in windows.values() {
+                                    let _ = entry.webview.evaluate_script(&script);
+                                }
+                            }
+                        }
+                    }
+                }
+                UserEvent::OpenWindow(url) => {
+                    match create_window(
+                        event_loop_window_target,
+                        &proxy,
+                        &config.app_title,
+                        &url,
+                        &profile,
+                        strategy.clone(),
+                    ) {
+                        Ok(entry) => {
+                            if let Some(region) = current_input_region.as_ref() {
+                                if let Err(err) = apply_input_region_to_window(&entry.window, region)
+                                {
+                                    eprintln!(
+                                        "failed to apply current input region to new window: {err:#}"
+                                    );
+                                }
+                            }
+                            windows.insert(entry.window.id(), entry);
+                        }
+                        Err(err) => {
+                            if let Ok(script) = build_emit_script(&HostEvent::Error {
+                                message: format!("failed to open new window: {err}"),
+                            }) {
+                                for entry in windows.values() {
+                                    let _ = entry.webview.evaluate_script(&script);
+                                }
+                            }
+                        }
+                    }
+                }
+                UserEvent::Terminate => {
+                    if let Some(mut runtime) = launcher_runtime.take() {
+                        runtime.handle.terminate();
+                    }
+                    *control_flow = ControlFlow::Exit;
+                }
+            },
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 window_id,
@@ -155,6 +175,9 @@ pub fn run(config: AppConfig) -> Result<()> {
             } => {
                 windows.remove(&window_id);
                 if windows.is_empty() {
+                    if let Some(mut runtime) = launcher_runtime.take() {
+                        runtime.handle.terminate();
+                    }
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -194,7 +217,7 @@ fn create_window(
     app_title: &str,
     url: &str,
     profile: &WaylandProfile,
-    strategy: crate::wayland::engine::StrategySelection,
+    strategy: StrategySelection,
 ) -> Result<WindowEntry> {
     let window = WindowBuilder::new()
         .with_title(app_title)
@@ -227,9 +250,7 @@ fn create_window(
     };
 
     #[cfg(not(target_os = "linux"))]
-    let webview = builder
-        .build(&window)
-        .context("failed to build webview")?;
+    let webview = builder.build(&window).context("failed to build webview")?;
 
     Ok(WindowEntry { window, webview })
 }

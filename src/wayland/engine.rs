@@ -16,38 +16,6 @@ pub struct StrategySelection {
     pub reason: &'static str,
 }
 
-pub trait WindowInputBackend {
-    fn strategy(&self) -> &StrategySelection;
-    fn apply_input_region(&mut self, region: &InputRegion) -> anyhow::Result<()>;
-}
-
-#[derive(Debug)]
-pub struct PrototypeBackend {
-    strategy: StrategySelection,
-}
-
-impl PrototypeBackend {
-    pub fn new(profile: &WaylandProfile) -> Self {
-        let strategy = choose_strategy(profile);
-        Self { strategy }
-    }
-}
-
-impl WindowInputBackend for PrototypeBackend {
-    fn strategy(&self) -> &StrategySelection {
-        &self.strategy
-    }
-
-    fn apply_input_region(&mut self, region: &InputRegion) -> anyhow::Result<()> {
-        eprintln!(
-            "prototype Wayland backend received input region with {} rect(s): {:?}",
-            region.rects().len(),
-            region.rects()
-        );
-        Ok(())
-    }
-}
-
 pub fn choose_strategy(profile: &WaylandProfile) -> StrategySelection {
     if !profile.is_wayland() {
         return StrategySelection {
@@ -57,15 +25,68 @@ pub fn choose_strategy(profile: &WaylandProfile) -> StrategySelection {
     }
 
     match profile.compositor_family {
-        CompositorFamily::Mutter | CompositorFamily::KWin | CompositorFamily::Wlroots | CompositorFamily::Niri => {
-            StrategySelection {
-                tier: StrategyTier::OverlayNoInputRegion,
-                reason: "Wayland session detected; native input-region engine not implemented yet",
-            }
-        }
+        CompositorFamily::Mutter
+        | CompositorFamily::KWin
+        | CompositorFamily::Wlroots
+        | CompositorFamily::Niri => StrategySelection {
+            tier: StrategyTier::NativeInputRegion,
+            reason: "Wayland session detected; using GTK/GDK input-shape bridge",
+        },
         CompositorFamily::Unknown => StrategySelection {
             tier: StrategyTier::StandardWindow,
             reason: "unknown compositor family; conservative fallback",
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_input_region_to_window(
+    window: &tao::window::Window,
+    region: &InputRegion,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, bail};
+    use cairo::{RectangleInt, Region};
+    use gtk::prelude::WidgetExt;
+    use tao::platform::unix::WindowExtUnix;
+
+    let gtk_window = window.gtk_window();
+    gtk_window.realize();
+
+    let display = gtk_window.display();
+    if !display.supports_input_shapes() {
+        bail!("GDK display does not report input-shape support");
+    }
+
+    let gdk_window = gtk_window
+        .window()
+        .context("GTK window has not been realized into a GDK window yet")?;
+
+    if region.is_empty() {
+        let empty_region = Region::create();
+        gdk_window.set_pass_through(true);
+        gdk_window.input_shape_combine_region(&empty_region, 0, 0);
+        gtk_window.input_shape_combine_region(Some(&empty_region));
+        return Ok(());
+    }
+
+    let rectangles = region
+        .rects()
+        .iter()
+        .map(|rect| RectangleInt::new(rect.x, rect.y, rect.width as i32, rect.height as i32))
+        .collect::<Vec<_>>();
+    let cairo_region = Region::create_rectangles(&rectangles);
+
+    gdk_window.set_pass_through(false);
+    gdk_window.input_shape_combine_region(&cairo_region, 0, 0);
+    gtk_window.input_shape_combine_region(Some(&cairo_region));
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_input_region_to_window(
+    _window: &tao::window::Window,
+    _region: &InputRegion,
+) -> anyhow::Result<()> {
+    Ok(())
 }

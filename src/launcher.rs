@@ -13,10 +13,16 @@ use serde_json::Value;
 #[derive(Debug)]
 pub struct LauncherHandle {
     child: Child,
+    terminated: bool,
 }
 
-impl Drop for LauncherHandle {
-    fn drop(&mut self) {
+impl LauncherHandle {
+    pub fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
@@ -38,6 +44,12 @@ impl Drop for LauncherHandle {
         let _ = self.child.kill();
 
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for LauncherHandle {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -151,7 +163,10 @@ pub fn start_launcher(repo_root: &Path) -> Result<LauncherRuntime> {
 
     Ok(LauncherRuntime {
         receiver,
-        handle: LauncherHandle { child },
+        handle: LauncherHandle {
+            child,
+            terminated: false,
+        },
     })
 }
 

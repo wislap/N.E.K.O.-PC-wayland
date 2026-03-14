@@ -1227,7 +1227,10 @@ name = "neko_pc_wayland"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cairo-rs",
  "ctrlc",
+ "gdk",
+ "gtk",
  "libc",
  "serde",
  "serde_json",

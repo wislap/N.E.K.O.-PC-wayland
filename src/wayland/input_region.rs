@@ -34,7 +34,8 @@ impl InputRegion {
 
     fn normalize(&mut self) {
         self.rects.retain(|rect| !rect.is_empty());
-        self.rects.sort_by_key(|rect| (rect.y, rect.x, rect.width, rect.height));
+        self.rects
+            .sort_by_key(|rect| (rect.y, rect.x, rect.width, rect.height));
         self.rects.dedup();
     }
 }
