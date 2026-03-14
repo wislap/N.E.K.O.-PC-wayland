@@ -7,7 +7,9 @@ Wayland-native desktop host prototype for `N.E.K.O`.
 This project is the first Rust host skeleton for Linux Wayland. It intentionally starts small:
 
 - discovers the sibling `N.E.K.O` repo
-- opens the configured frontend URL in a native Linux webview window
+- starts `launcher.py`
+- parses `NEKO_EVENT` messages to resolve the real runtime ports
+- opens the resolved frontend URL in a native Linux webview window
 - injects a minimal host/frontend IPC bridge as `window.NekoHost`
 - keeps the Wayland strategy/input-region design scaffold for future native window work
 
@@ -20,7 +22,7 @@ The Electron shell in `N.E.K.O.-PC` works well on Windows because the transparen
 This Rust host is the first step toward a better architecture:
 
 - UI: keep the existing HTML/CSS/JS frontend
-- Backend: out of scope for this binary right now
+- Backend: still managed by the existing Python launcher
 - Desktop host: move Linux windowing responsibility into a native Rust layer
 
 ## Requirements
@@ -29,6 +31,7 @@ This Rust host is the first step toward a better architecture:
 - `webkit2gtk-4.1` development package
 - `gtk4`
 - `N.E.K.O` repository available locally
+- `uv` recommended, or a working `python3`
 
 This machine already has:
 
@@ -53,12 +56,6 @@ If repo auto-discovery fails:
 
 ```bash
 NEKO_REPO_ROOT=/path/to/N.E.K.O cargo run
-```
-
-If the frontend is exposed on a different URL:
-
-```bash
-NEKO_FRONTEND_URL=http://127.0.0.1:48911/ cargo run --bin neko-pc-wayland
 ```
 
 ## IPC bridge

@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod ipc;
+mod launcher;
 mod wayland;
 
 use anyhow::Result;

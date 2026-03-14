@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail};
 pub struct AppConfig {
     pub repo_root: PathBuf,
     pub app_title: String,
-    pub frontend_url: String,
 }
 
 impl AppConfig {
@@ -28,8 +27,6 @@ impl AppConfig {
         Ok(Self {
             repo_root,
             app_title: "N.E.K.O.-PC-wayland".to_string(),
-            frontend_url: env::var("NEKO_FRONTEND_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:48911/".to_string()),
         })
     }
 }
