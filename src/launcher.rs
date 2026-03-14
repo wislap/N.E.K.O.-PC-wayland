@@ -230,13 +230,25 @@ fn apply_process_group(command: &mut Command) {
 
 pub fn wait_for_frontend_url(runtime: &LauncherRuntime) -> Result<PortSnapshot> {
     let mut ports = PortSnapshot::default();
+    let mut backend_ready = false;
     let mut saw_startup_in_progress = false;
+    let mut expected_launch_id: Option<String> = None;
     let snapshot_path = runtime_snapshot_path();
     let deadline = Instant::now() + Duration::from_secs(90);
 
     loop {
         match runtime.receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(event) => {
+                if expected_launch_id.is_none() && event.event == "startup_begin" {
+                    expected_launch_id = event.launch_id.clone();
+                }
+
+                if let Some(expected) = expected_launch_id.as_deref() {
+                    if event.launch_id.as_deref() != Some(expected) {
+                        continue;
+                    }
+                }
+
                 ports.absorb(&event);
 
                 if matches!(event.event.as_str(), "startup_failure") {
@@ -247,9 +259,15 @@ pub fn wait_for_frontend_url(runtime: &LauncherRuntime) -> Result<PortSnapshot> 
                     saw_startup_in_progress = true;
                 }
 
-                if let Some(url) = ports.frontend_url() {
-                    eprintln!("resolved frontend url from launcher: {url}");
-                    return Ok(ports);
+                if matches!(event.event.as_str(), "startup_ready" | "attach_existing") {
+                    backend_ready = true;
+                }
+
+                if backend_ready {
+                    if let Some(url) = ports.frontend_url() {
+                        eprintln!("resolved frontend url after backend ready: {url}");
+                        return Ok(ports);
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -260,11 +278,18 @@ pub fn wait_for_frontend_url(runtime: &LauncherRuntime) -> Result<PortSnapshot> 
             }
         }
 
-        if let Some(snapshot) = try_read_runtime_snapshot(&snapshot_path)? {
-            ports.absorb(&snapshot);
-            if let Some(url) = ports.frontend_url() {
-                eprintln!("resolved frontend url from shared runtime snapshot: {url}");
-                return Ok(ports);
+        if saw_startup_in_progress {
+            if let Some(snapshot) = try_read_runtime_snapshot(&snapshot_path)? {
+                ports.absorb(&snapshot);
+                if matches!(snapshot.event.as_str(), "startup_ready" | "attach_existing") {
+                    backend_ready = true;
+                }
+                if backend_ready {
+                    if let Some(url) = ports.frontend_url() {
+                        eprintln!("resolved frontend url from ready runtime snapshot: {url}");
+                        return Ok(ports);
+                    }
+                }
             }
         }
 
@@ -273,7 +298,7 @@ pub fn wait_for_frontend_url(runtime: &LauncherRuntime) -> Result<PortSnapshot> 
         }
     }
 
-    bail!("launcher event channel closed before frontend url became available")
+    bail!("launcher did not report backend ready before frontend url became available")
 }
 
 fn parse_neko_event(line: &str) -> Option<LauncherEventEnvelope> {

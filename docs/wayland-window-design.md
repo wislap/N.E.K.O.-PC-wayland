@@ -230,3 +230,37 @@ Keep the current `tao + wry` host for bootstrapping and web rendering, but build
 - native Wayland layer owns window/input behavior
 
 That separation is what lets us keep one AppImage while still branching per compositor at runtime.
+
+## Current implementation status
+
+The repository now contains a `wayland::raw_host` module that proves the native route works on real Wayland sessions:
+
+- pure Rust Wayland `xdg_toplevel`
+- explicit `wl_surface.set_input_region`
+- transparent pixels outside the interactive region
+- native `xdg_toplevel.move` from the interactive region
+- runtime `set_input_region(...)` updates through a host control handle
+- separate visible-region and input-region handling inside the native host
+- runtime RGBA frame submission through the native host control handle
+
+For safety, the main `neko-pc-wayland` app still keeps the existing `tao + wry` frontend path by default.
+
+An opt-in development bridge is available:
+
+- set `NEKO_WAYLAND_ENABLE_RAW_HOST_COMPANION=1`
+- the main app will spawn a native Wayland companion host
+- frontend-driven input-region updates are mirrored into that native host
+
+This is the transitional step before replacing the Linux Wayland window host completely.
+
+The app now also supports an explicit host mode switch:
+
+- `NEKO_WAYLAND_HOST_MODE=legacy`
+  Keeps the current `tao + wry` path only.
+
+- `NEKO_WAYLAND_HOST_MODE=companion`
+  Starts the current `tao + wry` frontend and mirrors input-region updates into the native Wayland host.
+
+- `NEKO_WAYLAND_HOST_MODE=raw_only`
+  Starts the native Wayland host directly from the main app entry, without creating the `tao + wry` window.
+  If no explicit input region is provided yet, the app now falls back to a built-in debug region and visible debug background so the host is not mistaken for an empty transparent window.

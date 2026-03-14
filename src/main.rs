@@ -1,10 +1,5 @@
-mod app;
-mod config;
-mod ipc;
-mod launcher;
-mod wayland;
-
 use anyhow::Result;
+use neko_pc_wayland::{app, config};
 
 fn main() {
     if let Err(err) = run() {
