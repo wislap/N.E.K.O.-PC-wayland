@@ -51,6 +51,7 @@ pub struct RawHostConfig {
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
+    pub input_region_source_size: Option<(u32, u32)>,
     pub input_region: InputRegion,
     pub visible_region: Option<InputRegion>,
     pub transparent_outside_input_region: bool,
@@ -163,6 +164,7 @@ impl RawHostConfig {
             width: 800,
             height: 600,
             fullscreen: false,
+            input_region_source_size: None,
             input_region: InputRegion::from_rects(vec![InteractiveRect {
                 x: 0,
                 y: 0,
@@ -291,7 +293,14 @@ fn run_inner_with_running(
             width: config.width,
             height: config.height,
             fullscreen: config.fullscreen,
-            input_region: config.input_region.clone(),
+            input_region_source_size: config.input_region_source_size,
+            source_input_region: config.input_region.clone(),
+            input_region: scale_input_region_to_window(
+                &config.input_region,
+                config.input_region_source_size,
+                config.width,
+                config.height,
+            ),
             visible_region: config.visible_region.clone(),
             frame: None,
             input_region_applied: false,
@@ -445,6 +454,8 @@ struct RawHostRuntime {
     width: u32,
     height: u32,
     fullscreen: bool,
+    input_region_source_size: Option<(u32, u32)>,
+    source_input_region: InputRegion,
     input_region: InputRegion,
     visible_region: Option<InputRegion>,
     frame: Option<RawHostFrame>,
@@ -496,7 +507,13 @@ impl RawHostApp {
     fn handle_command(&mut self, command: RawHostCommand) -> Result<()> {
         match command {
             RawHostCommand::SetInputRegion(region) => {
-                self.runtime.input_region = region;
+                self.runtime.source_input_region = region;
+                self.runtime.input_region = scale_input_region_to_window(
+                    &self.runtime.source_input_region,
+                    self.runtime.input_region_source_size,
+                    self.runtime.width,
+                    self.runtime.height,
+                );
                 self.runtime.input_region_applied = false;
                 self.draw()?;
             }
@@ -586,8 +603,13 @@ impl RawHostApp {
         let frame_ref = self.runtime.frame.as_ref();
 
         if let Some(frame) = frame_ref {
-            if frame.width == width && frame.height == height && region_covers_full_window(visible_region, width, height) {
+            if frame.width == width
+                && frame.height == height
+                && region_covers_full_window(visible_region, width, height)
+            {
                 blit_fullscreen_rgba_to_argb(canvas, frame);
+            } else if region_covers_full_window(visible_region, width, height) {
+                blit_scaled_fullscreen_rgba_to_argb(canvas, width, height, frame);
             } else {
                 draw_frame_with_regions(
                     canvas,
@@ -627,6 +649,41 @@ fn point_in_rect(x: i32, y: i32, rect: &crate::wayland::input_region::Interactiv
     x >= rect.x && y >= rect.y && x < right && y < bottom
 }
 
+fn scale_input_region_to_window(
+    region: &InputRegion,
+    source_size: Option<(u32, u32)>,
+    dst_width: u32,
+    dst_height: u32,
+) -> InputRegion {
+    let Some((src_width, src_height)) = source_size else {
+        return region.clone();
+    };
+    if src_width == 0
+        || src_height == 0
+        || dst_width == 0
+        || dst_height == 0
+        || (src_width == dst_width && src_height == dst_height)
+    {
+        return region.clone();
+    }
+
+    InputRegion::from_rects(
+        region
+            .rects()
+            .iter()
+            .map(|rect| InteractiveRect {
+                x: ((i64::from(rect.x) * i64::from(dst_width)) / i64::from(src_width)) as i32,
+                y: ((i64::from(rect.y) * i64::from(dst_height)) / i64::from(src_height)) as i32,
+                width: ((u64::from(rect.width) * u64::from(dst_width)) / u64::from(src_width))
+                    .max(1) as u32,
+                height: ((u64::from(rect.height) * u64::from(dst_height))
+                    / u64::from(src_height))
+                .max(1) as u32,
+            })
+            .collect(),
+    )
+}
+
 fn region_covers_full_window(region: &InputRegion, width: u32, height: u32) -> bool {
     matches!(
         region.rects(),
@@ -645,6 +702,43 @@ fn blit_fullscreen_rgba_to_argb(canvas: &mut [u8], frame: &RawHostFrame) {
         dst[1] = src[1];
         dst[2] = src[0];
         dst[3] = src[3];
+    }
+}
+
+fn blit_scaled_fullscreen_rgba_to_argb(
+    canvas: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    frame: &RawHostFrame,
+) {
+    if dst_width == 0 || dst_height == 0 || frame.width == 0 || frame.height == 0 {
+        canvas.fill(0);
+        return;
+    }
+
+    let dst_width_usize = dst_width as usize;
+    let src_width_usize = frame.width as usize;
+    let mut src_x_map = Vec::with_capacity(dst_width_usize);
+    for dst_x in 0..dst_width {
+        let src_x = ((dst_x as u64 * frame.width as u64) / dst_width as u64)
+            .min(frame.width.saturating_sub(1) as u64) as usize;
+        src_x_map.push(src_x);
+    }
+
+    for dst_y in 0..dst_height as usize {
+        let src_y = ((dst_y as u64 * frame.height as u64) / dst_height as u64)
+            .min(frame.height.saturating_sub(1) as u64) as usize;
+        let src_row = &frame.rgba[src_y * src_width_usize * 4..(src_y + 1) * src_width_usize * 4];
+        let dst_row =
+            &mut canvas[dst_y * dst_width_usize * 4..(dst_y + 1) * dst_width_usize * 4];
+        for (dst_x, src_x) in src_x_map.iter().copied().enumerate() {
+            let src_base = src_x * 4;
+            let dst_base = dst_x * 4;
+            dst_row[dst_base] = src_row[src_base + 2];
+            dst_row[dst_base + 1] = src_row[src_base + 1];
+            dst_row[dst_base + 2] = src_row[src_base];
+            dst_row[dst_base + 3] = src_row[src_base + 3];
+        }
     }
 }
 
@@ -858,6 +952,13 @@ impl WindowHandler for RawHostApp {
             .1
             .map(|value| value.get())
             .unwrap_or(self.runtime.height);
+        self.runtime.input_region = scale_input_region_to_window(
+            &self.runtime.source_input_region,
+            self.runtime.input_region_source_size,
+            self.runtime.width,
+            self.runtime.height,
+        );
+        self.runtime.input_region_applied = false;
         eprintln!(
             "raw host configure: {}x{}",
             self.runtime.width, self.runtime.height

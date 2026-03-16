@@ -670,13 +670,26 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
     let mut key_modifiers = 0_u32;
     let mut last_frame_push_at = None::<Instant>;
     let mut last_frontend_input_region = None::<InputRegion>;
+    let frame_push_interval = Duration::from_millis(
+        (1000_u64 / u64::from(config.render_fps.max(1))).max(1),
+    );
+    let mut helper_shutdown_started = false;
+    let mut helper_shutdown_deadline = None::<Instant>;
 
     loop {
+        if !raw_host_handle.is_running() && !stop_requested.load(Ordering::Relaxed) {
+            eprintln!("raw host exited; requesting helper shutdown");
+            stop_requested.store(true, Ordering::Relaxed);
+        }
+
         if stop_requested.load(Ordering::Relaxed) {
-            eprintln!("shutdown requested; terminating C standalone helper");
-            let _ = helper.send_shutdown();
-            let _ = helper.terminate();
-            let _ = raw_host_handle.shutdown();
+            if !helper_shutdown_started {
+                eprintln!("shutdown requested; terminating C standalone helper");
+                let _ = helper.send_shutdown();
+                let _ = raw_host_handle.shutdown();
+                helper_shutdown_started = true;
+                helper_shutdown_deadline = Some(Instant::now() + Duration::from_secs(2));
+            }
         }
 
         if saw_browser_created {
@@ -721,6 +734,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 &mut saw_browser_created,
                 &mut saw_load_end,
                 &mut saw_shutdown_ok,
+                frame_push_interval,
                 &mut last_frame_push_at,
                 &mut last_frontend_input_region,
                 Some((&raw_host_handle, &frame_dump_path)),
@@ -734,6 +748,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 &mut saw_browser_created,
                 &mut saw_load_end,
                 &mut saw_shutdown_ok,
+                frame_push_interval,
                 &mut last_frame_push_at,
                 &mut last_frontend_input_region,
                 Some((&raw_host_handle, &frame_dump_path)),
@@ -771,6 +786,29 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
             let _ = raw_host.join();
             bail!("C standalone helper exited with status {status}");
         }
+
+        if helper_shutdown_started {
+            if let Some(deadline) = helper_shutdown_deadline {
+                if Instant::now() >= deadline {
+                    let _ = helper.terminate();
+                    helper_shutdown_deadline = None;
+                }
+            }
+            if let Some(status) = helper.try_wait()? {
+                let _ = raw_host.join();
+                if let Some(mut runtime) = launcher_runtime.take() {
+                    runtime.handle.terminate();
+                }
+                if status.success() {
+                    return Ok(());
+                }
+                #[cfg(unix)]
+                if matches!(status.signal(), Some(2) | Some(15)) {
+                    return Ok(());
+                }
+                bail!("C standalone helper exited with status {status}");
+            }
+        }
     }
 }
 
@@ -780,6 +818,7 @@ fn drain_c_standalone_events(
     saw_browser_created: &mut bool,
     saw_load_end: &mut bool,
     saw_shutdown_ok: &mut bool,
+    frame_push_interval: Duration,
     last_frame_push_at: &mut Option<Instant>,
     last_frontend_input_region: &mut Option<InputRegion>,
     frame_sink: Option<(&RawHostHandle, &std::path::Path)>,
@@ -793,6 +832,7 @@ fn drain_c_standalone_events(
                 saw_browser_created,
                 saw_load_end,
                 saw_shutdown_ok,
+                frame_push_interval,
                 last_frame_push_at,
                 last_frontend_input_region,
                 frame_sink,
@@ -809,6 +849,7 @@ fn apply_c_standalone_event(
     saw_browser_created: &mut bool,
     saw_load_end: &mut bool,
     saw_shutdown_ok: &mut bool,
+    frame_push_interval: Duration,
     last_frame_push_at: &mut Option<Instant>,
     last_frontend_input_region: &mut Option<InputRegion>,
     frame_sink: Option<(&RawHostHandle, &std::path::Path)>,
@@ -850,7 +891,7 @@ fn apply_c_standalone_event(
             let now = Instant::now();
             if last_frame_push_at
                 .as_ref()
-                .is_some_and(|last| now.duration_since(*last) < Duration::from_millis(33))
+                .is_some_and(|last| now.duration_since(*last) < frame_push_interval)
             {
                 return Ok(());
             }
@@ -864,7 +905,7 @@ fn apply_c_standalone_event(
                 match load_bgra_frame(frame_dump_path, width as u32, height as u32) {
                     Ok(rgba_frame) => {
                         if let Err(err) = raw_host.set_rgba_frame(rgba_frame) {
-                            eprintln!("failed to push dumped CEF frame into raw host: {err:#}");
+                            return Err(err).context("failed to push dumped CEF frame into raw host");
                         } else {
                             *last_frame_push_at = Some(now);
                             if frame <= 2 {
@@ -896,7 +937,7 @@ fn apply_c_standalone_event(
             }
             if let Some((raw_host, _)) = frame_sink {
                 if let Err(err) = raw_host.set_input_region(region.clone()) {
-                    eprintln!("failed to push frontend input region into raw host: {err:#}");
+                    return Err(err).context("failed to push frontend input region into raw host");
                 } else {
                     *last_frontend_input_region = Some(region.clone());
                     eprintln!(
@@ -997,6 +1038,7 @@ fn build_raw_cef_host_config(config: &AppConfig, install_ctrlc_handler: bool) ->
         current_input_region_or_empty(config),
         install_ctrlc_handler,
     );
+    raw_host_config.input_region_source_size = Some((config.render_width, config.render_height));
     let full_region =
         InputRegion::from_rects(vec![crate::wayland::input_region::InteractiveRect {
             x: 0,

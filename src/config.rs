@@ -75,7 +75,7 @@ fn default_render_height() -> u32 {
 }
 
 fn default_render_fps() -> u32 {
-    if parse_fullscreen_flag() { 12 } else { 30 }
+    if parse_fullscreen_flag() { 6 } else { 30 }
 }
 
 fn parse_dimension(name: &str, default: u32) -> Result<u32> {
