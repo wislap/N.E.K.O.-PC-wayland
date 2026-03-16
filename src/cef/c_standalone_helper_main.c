@@ -761,6 +761,9 @@ static void on_paint(void* user_data,
   }
   maybe_dump_frame(state, buffer, width, height);
   maybe_write_shared_frame(state, buffer, width, height);
+  if (element_type != 0) {
+    return;
+  }
   emit_event("paint", details);
 }
 
@@ -776,6 +779,7 @@ int main(int argc, char** argv) {
   size_t command_buffer_used;
   int code;
   int should_shutdown = 0;
+  int loop_sleep_ms = 4;
 
   memset(&settings, 0, sizeof(settings));
   memset(&state, 0, sizeof(state));
@@ -787,6 +791,7 @@ int main(int argc, char** argv) {
   settings.locale = env_or_null("NEKO_CEF_LOCALE");
   settings.cache_path = env_or_null("NEKO_CEF_CACHE_PATH");
   settings.root_cache_path = env_or_null("NEKO_CEF_ROOT_CACHE_PATH");
+  loop_sleep_ms = env_int_or_default("NEKO_CEF_HELPER_LOOP_SLEEP_MS", 4);
   state.shared_frame_fd = env_int_or_default("NEKO_CEF_SHARED_FRAME_FD", -1);
   state.shared_frame_map_len = env_size_or_zero("NEKO_CEF_SHARED_FRAME_SIZE");
   {
@@ -898,13 +903,13 @@ int main(int argc, char** argv) {
     while (!should_shutdown) {
       should_shutdown = process_stdin_commands(browser, command_buffer, &command_buffer_used);
       cef_do_message_loop_work();
-      sleep_ms(10);
+      sleep_ms(loop_sleep_ms);
     }
 
     neko_cef_bridge_browser_close(browser);
     for (int i = 0; i < 60; ++i) {
       cef_do_message_loop_work();
-      sleep_ms(10);
+      sleep_ms(loop_sleep_ms);
     }
     neko_cef_bridge_browser_release(browser);
     emit_event("browser_released", "");
