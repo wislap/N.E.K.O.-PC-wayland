@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -67,8 +68,25 @@ typedef struct _neko_cef_standalone_state_t {
   int frame_count;
   int frame_dump_log_emitted;
   char frame_dump_path[1024];
+  void* shared_frame_map;
+  size_t shared_frame_map_len;
+  int shared_frame_fd;
   neko_cef_browser_t* browser;
 } neko_cef_standalone_state_t;
+
+typedef struct _neko_shared_frame_header_t {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t seq;
+  uint32_t frame;
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride;
+  uint32_t data_len;
+} neko_shared_frame_header_t;
+
+#define NEKO_SHARED_FRAME_MAGIC 0x4E4B4642u
+#define NEKO_SHARED_FRAME_VERSION 1u
 
 extern int neko_cef_bridge_execute_process(int argc, char** argv, int use_app);
 extern neko_cef_runtime_t* neko_cef_bridge_initialize(
@@ -148,6 +166,20 @@ static int env_int_or_default(const char* name, int default_value) {
     return default_value;
   }
   return (int)parsed;
+}
+
+static size_t env_size_or_zero(const char* name) {
+  const char* value = env_or_null(name);
+  char* end = NULL;
+  unsigned long long parsed;
+  if (!value) {
+    return 0;
+  }
+  parsed = strtoull(value, &end, 10);
+  if (end == value || (end && *end != '\0')) {
+    return 0;
+  }
+  return (size_t)parsed;
 }
 
 static void emit_event(const char* event, const char* details) {
@@ -634,6 +666,46 @@ static void maybe_dump_frame(neko_cef_standalone_state_t* state,
   }
 }
 
+static void maybe_write_shared_frame(neko_cef_standalone_state_t* state,
+                                     const void* buffer,
+                                     int width,
+                                     int height) {
+  neko_shared_frame_header_t* header;
+  size_t data_len;
+  uint8_t* payload;
+
+  if (!state || !state->shared_frame_map || state->shared_frame_map_len < sizeof(*header) || !buffer ||
+      width <= 0 || height <= 0) {
+    return;
+  }
+
+  data_len = (size_t)width * (size_t)height * 4u;
+  if (sizeof(*header) + data_len > state->shared_frame_map_len) {
+    fprintf(stderr,
+            "NEKO_CEF_STANDALONE shared frame too small: map=%zu need=%zu\n",
+            state->shared_frame_map_len,
+            sizeof(*header) + data_len);
+    fflush(stderr);
+    return;
+  }
+
+  header = (neko_shared_frame_header_t*)state->shared_frame_map;
+  payload = (uint8_t*)state->shared_frame_map + sizeof(*header);
+
+  __sync_add_and_fetch(&header->seq, 1);
+  __sync_synchronize();
+  header->magic = NEKO_SHARED_FRAME_MAGIC;
+  header->version = NEKO_SHARED_FRAME_VERSION;
+  header->frame = (uint32_t)(state ? state->frame_count : 0);
+  header->width = (uint32_t)width;
+  header->height = (uint32_t)height;
+  header->stride = (uint32_t)width * 4u;
+  header->data_len = (uint32_t)data_len;
+  memcpy(payload, buffer, data_len);
+  __sync_synchronize();
+  __sync_add_and_fetch(&header->seq, 1);
+}
+
 static void on_paint(void* user_data,
                      int element_type,
                      const void* buffer,
@@ -665,6 +737,7 @@ static void on_paint(void* user_data,
     fflush(stderr);
   }
   maybe_dump_frame(state, buffer, width, height);
+  maybe_write_shared_frame(state, buffer, width, height);
   emit_event("paint", details);
 }
 
@@ -691,10 +764,33 @@ int main(int argc, char** argv) {
   settings.locale = env_or_null("NEKO_CEF_LOCALE");
   settings.cache_path = env_or_null("NEKO_CEF_CACHE_PATH");
   settings.root_cache_path = env_or_null("NEKO_CEF_ROOT_CACHE_PATH");
+  state.shared_frame_fd = env_int_or_default("NEKO_CEF_SHARED_FRAME_FD", -1);
+  state.shared_frame_map_len = env_size_or_zero("NEKO_CEF_SHARED_FRAME_SIZE");
   {
     const char* frame_dump_path = env_or_null("NEKO_CEF_FRAME_DUMP_PATH");
     if (frame_dump_path) {
       snprintf(state.frame_dump_path, sizeof(state.frame_dump_path), "%s", frame_dump_path);
+    }
+  }
+  if (state.shared_frame_fd >= 0 && state.shared_frame_map_len > 0) {
+    state.shared_frame_map =
+        mmap(NULL, state.shared_frame_map_len, PROT_READ | PROT_WRITE, MAP_SHARED, state.shared_frame_fd, 0);
+    if (state.shared_frame_map == MAP_FAILED) {
+      fprintf(stderr,
+              "NEKO_CEF_STANDALONE failed to mmap shared frame bridge fd=%d size=%zu: %s\n",
+              state.shared_frame_fd,
+              state.shared_frame_map_len,
+              strerror(errno));
+      fflush(stderr);
+      state.shared_frame_map = NULL;
+      state.shared_frame_map_len = 0;
+    } else {
+      memset(state.shared_frame_map, 0, state.shared_frame_map_len);
+      fprintf(stderr,
+              "NEKO_CEF_STANDALONE using shared frame bridge fd=%d size=%zu\n",
+              state.shared_frame_fd,
+              state.shared_frame_map_len);
+      fflush(stderr);
     }
   }
   settings.no_sandbox = 1;
@@ -705,14 +801,16 @@ int main(int argc, char** argv) {
   settings.use_app = 1;
 
   fprintf(stderr,
-          "NEKO_CEF_STANDALONE main argc=%d argv0=%s cwd settings: subprocess=%s resources=%s locales=%s locale=%s frame_dump=%s\n",
+          "NEKO_CEF_STANDALONE main argc=%d argv0=%s cwd settings: subprocess=%s resources=%s locales=%s locale=%s frame_dump=%s shared_fd=%d shared_size=%zu\n",
           argc,
           (argc > 0 && argv && argv[0]) ? argv[0] : "<null>",
           settings.browser_subprocess_path ? settings.browser_subprocess_path : "<null>",
           settings.resources_dir_path ? settings.resources_dir_path : "<null>",
           settings.locales_dir_path ? settings.locales_dir_path : "<null>",
           settings.locale ? settings.locale : "<null>",
-          state.frame_dump_path[0] ? state.frame_dump_path : "<null>");
+          state.frame_dump_path[0] ? state.frame_dump_path : "<null>",
+          state.shared_frame_fd,
+          state.shared_frame_map_len);
   fflush(stderr);
   emit_event("startup", "");
   configure_nonblocking_stdin();
@@ -792,6 +890,9 @@ int main(int argc, char** argv) {
   }
 
   neko_cef_bridge_shutdown(runtime);
+  if (state.shared_frame_map && state.shared_frame_map_len > 0) {
+    munmap(state.shared_frame_map, state.shared_frame_map_len);
+  }
   emit_event("shutdown_ok", "");
   fprintf(stderr, "NEKO_CEF_STANDALONE shutdown ok\n");
   fflush(stderr);

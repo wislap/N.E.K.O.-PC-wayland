@@ -15,7 +15,7 @@ use smithay_client_toolkit::reexports::calloop::channel::{
     Event as ChannelEvent, Sender as ChannelSender, channel,
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
-use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState, SimpleGlobal};
 use smithay_client_toolkit::seat::{
     Capability, SeatHandler, SeatState,
     keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
@@ -34,12 +34,17 @@ use smithay_client_toolkit::shm::{
 };
 use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
+    delegate_seat, delegate_shm, delegate_simple, delegate_xdg_shell, delegate_xdg_window,
+    registry_handlers,
 };
 use wayland_client::{
-    Connection, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::{self, WpViewport},
+    wp_viewporter::WpViewporter,
 };
 
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
@@ -132,11 +137,30 @@ pub enum RawHostKeyboardEvent {
 pub struct RawHostFrame {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub bgra: Vec<u8>,
 }
 
 impl RawHostFrame {
-    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self> {
+    pub fn from_bgra(width: u32, height: u32, bgra: Vec<u8>) -> Result<Self> {
+        let expected_len = width as usize * height as usize * 4;
+        if bgra.len() != expected_len {
+            return Err(anyhow!(
+                "invalid BGRA frame length {}, expected {} for {}x{}",
+                bgra.len(),
+                expected_len,
+                width,
+                height
+            ));
+        }
+
+        Ok(Self {
+            width,
+            height,
+            bgra,
+        })
+    }
+
+    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self> {
         let expected_len = width as usize * height as usize * 4;
         if rgba.len() != expected_len {
             return Err(anyhow!(
@@ -148,11 +172,15 @@ impl RawHostFrame {
             ));
         }
 
-        Ok(Self {
-            width,
-            height,
-            rgba,
-        })
+        let mut bgra = vec![0_u8; expected_len];
+        for (src, dst) in rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
+        }
+
+        Self::from_bgra(width, height, bgra)
     }
 }
 
@@ -188,9 +216,13 @@ pub fn run(config: RawHostConfig) -> Result<()> {
 pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
     let (sender, receiver) = channel::<RawHostCommand>();
     let running = Arc::new(AtomicBool::new(true));
+    let latest_frame = Arc::new(Mutex::new(None));
+    let frame_update_pending = Arc::new(AtomicBool::new(false));
     let pointer_subscribers = Arc::new(Mutex::new(Vec::new()));
     let keyboard_subscribers = Arc::new(Mutex::new(Vec::new()));
     let thread_running = Arc::clone(&running);
+    let thread_latest_frame = Arc::clone(&latest_frame);
+    let thread_frame_update_pending = Arc::clone(&frame_update_pending);
     let thread_pointer_subscribers = Arc::clone(&pointer_subscribers);
     let thread_keyboard_subscribers = Arc::clone(&keyboard_subscribers);
     let thread = thread::Builder::new()
@@ -200,6 +232,8 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
                 config,
                 Some(receiver),
                 thread_running,
+                thread_latest_frame,
+                thread_frame_update_pending,
                 thread_pointer_subscribers,
                 thread_keyboard_subscribers,
             )
@@ -210,6 +244,8 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
         handle: RawHostHandle {
             sender,
             running,
+            latest_frame,
+            frame_update_pending,
             pointer_subscribers,
             keyboard_subscribers,
         },
@@ -222,10 +258,14 @@ fn run_inner(
     commands: Option<smithay_client_toolkit::reexports::calloop::channel::Channel<RawHostCommand>>,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
+    let latest_frame = Arc::new(Mutex::new(None));
+    let frame_update_pending = Arc::new(AtomicBool::new(false));
     run_inner_with_running(
         config,
         commands,
         running,
+        latest_frame,
+        frame_update_pending,
         Arc::new(Mutex::new(Vec::new())),
         Arc::new(Mutex::new(Vec::new())),
     )
@@ -235,6 +275,8 @@ fn run_inner_with_running(
     config: RawHostConfig,
     commands: Option<smithay_client_toolkit::reexports::calloop::channel::Channel<RawHostCommand>>,
     running: Arc<AtomicBool>,
+    latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
+    frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
     keyboard_subscribers: Arc<Mutex<Vec<Sender<RawHostKeyboardEvent>>>>,
 ) -> Result<()> {
@@ -255,6 +297,7 @@ fn run_inner_with_running(
         CompositorState::bind(&globals, &qh).context("wl_compositor is not available")?;
     let xdg_shell = XdgShell::bind(&globals, &qh).context("xdg_shell is not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm is not available")?;
+    let viewporter = SimpleGlobal::<WpViewporter, 1>::bind(&globals, &qh).ok();
 
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::None, &qh);
@@ -269,6 +312,10 @@ fn run_inner_with_running(
         window.set_max_size(Some((config.width, config.height)));
     }
     window.commit();
+    let viewport = viewporter
+        .as_ref()
+        .and_then(|global| global.get().ok())
+        .map(|viewporter| viewporter.get_viewport(window.wl_surface(), &qh, ()));
 
     let pool = SlotPool::new((config.width * config.height * 4) as usize, &shm)
         .context("failed to create shm pool")?;
@@ -289,6 +336,8 @@ fn run_inner_with_running(
         shm,
         pool,
         window,
+        viewporter,
+        viewport,
         runtime: RawHostRuntime {
             width: config.width,
             height: config.height,
@@ -310,12 +359,15 @@ fn run_inner_with_running(
             log_pointer_events: config.log_pointer_events,
         },
         buffer: None,
+        buffer_dimensions: None,
         first_configure: true,
         exit: false,
         pointer: None,
         keyboard: None,
         pointer_inside: false,
         running,
+        latest_frame,
+        frame_update_pending,
         pointer_subscribers,
         keyboard_subscribers,
         modifiers: RawHostModifiers::default(),
@@ -382,6 +434,8 @@ impl RawHostThread {
 pub struct RawHostHandle {
     sender: ChannelSender<RawHostCommand>,
     running: Arc<AtomicBool>,
+    latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
+    frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
     keyboard_subscribers: Arc<Mutex<Vec<Sender<RawHostKeyboardEvent>>>>,
 }
@@ -406,9 +460,19 @@ impl RawHostHandle {
     }
 
     pub fn set_rgba_frame(&self, frame: RawHostFrame) -> Result<()> {
-        self.sender
-            .send(RawHostCommand::SetFrame(frame))
-            .context("failed to send RGBA frame to raw host")
+        {
+            let mut latest_frame = self
+                .latest_frame
+                .lock()
+                .expect("latest frame mutex poisoned");
+            *latest_frame = Some(frame);
+        }
+        if !self.frame_update_pending.swap(true, Ordering::SeqCst) {
+            self.sender
+                .send(RawHostCommand::FrameReady)
+                .context("failed to notify raw host about latest frame")?;
+        }
+        Ok(())
     }
 
     pub fn clear_frame(&self) -> Result<()> {
@@ -444,7 +508,7 @@ impl RawHostHandle {
 enum RawHostCommand {
     SetInputRegion(InputRegion),
     SetVisibleRegion(Option<InputRegion>),
-    SetFrame(RawHostFrame),
+    FrameReady,
     ClearFrame,
     Shutdown,
 }
@@ -474,14 +538,19 @@ struct RawHostApp {
     shm: Shm,
     pool: SlotPool,
     window: Window,
+    viewporter: Option<SimpleGlobal<WpViewporter, 1>>,
+    viewport: Option<WpViewport>,
     runtime: RawHostRuntime,
     buffer: Option<Buffer>,
+    buffer_dimensions: Option<(u32, u32)>,
     first_configure: bool,
     exit: bool,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer_inside: bool,
     running: Arc<AtomicBool>,
+    latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
+    frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
     keyboard_subscribers: Arc<Mutex<Vec<Sender<RawHostKeyboardEvent>>>>,
     modifiers: RawHostModifiers,
@@ -515,17 +584,20 @@ impl RawHostApp {
                     self.runtime.height,
                 );
                 self.runtime.input_region_applied = false;
-                self.draw()?;
+                self.apply_input_region()?;
             }
             RawHostCommand::SetVisibleRegion(region) => {
                 self.runtime.visible_region = region;
                 self.draw()?;
             }
-            RawHostCommand::SetFrame(frame) => {
-                self.runtime.frame = Some(frame);
-                self.draw()?;
+            RawHostCommand::FrameReady => {
+                self.consume_latest_frame()?;
             }
             RawHostCommand::ClearFrame => {
+                self.frame_update_pending.store(false, Ordering::SeqCst);
+                if let Ok(mut latest_frame) = self.latest_frame.lock() {
+                    latest_frame.take();
+                }
                 self.runtime.frame = None;
                 self.draw()?;
             }
@@ -534,6 +606,35 @@ impl RawHostApp {
                 self.running.store(false, Ordering::SeqCst);
             }
         }
+        Ok(())
+    }
+
+    fn consume_latest_frame(&mut self) -> Result<()> {
+        loop {
+            let next_frame = {
+                let mut latest_frame = self
+                    .latest_frame
+                    .lock()
+                    .expect("latest frame mutex poisoned");
+                latest_frame.take()
+            };
+
+            if let Some(frame) = next_frame {
+                self.runtime.frame = Some(frame);
+                self.draw()?;
+            }
+
+            self.frame_update_pending.store(false, Ordering::SeqCst);
+            let has_newer_frame = self
+                .latest_frame
+                .lock()
+                .expect("latest frame mutex poisoned")
+                .is_some();
+            if !has_newer_frame || self.frame_update_pending.swap(true, Ordering::SeqCst) {
+                break;
+            }
+        }
+
         Ok(())
     }
 
@@ -548,6 +649,7 @@ impl RawHostApp {
             );
         }
         self.window.set_input_region(Some(region.wl_region()));
+        self.window.commit();
         self.runtime.input_region_applied = true;
         eprintln!(
             "applied raw wl_surface input-region with {} rect(s): {:?}",
@@ -558,7 +660,10 @@ impl RawHostApp {
     }
 
     fn draw(&mut self) -> Result<()> {
-        let stride = self.runtime.width as i32 * 4;
+        let (draw_width, draw_height) = self
+            .preferred_buffer_size()
+            .unwrap_or((self.runtime.width, self.runtime.height));
+        let stride = draw_width as i32 * 4;
         let width = self.runtime.width;
         let height = self.runtime.height;
 
@@ -566,11 +671,16 @@ impl RawHostApp {
             self.apply_input_region()?;
         }
 
+        if self.buffer_dimensions != Some((draw_width, draw_height)) {
+            self.buffer = None;
+            self.buffer_dimensions = Some((draw_width, draw_height));
+        }
+
         let buffer = self.buffer.get_or_insert_with(|| {
             self.pool
                 .create_buffer(
-                    width as i32,
-                    height as i32,
+                    draw_width as i32,
+                    draw_height as i32,
                     stride,
                     wl_shm::Format::Argb8888,
                 )
@@ -584,8 +694,8 @@ impl RawHostApp {
                 let (next_buffer, canvas) = self
                     .pool
                     .create_buffer(
-                        width as i32,
-                        height as i32,
+                        draw_width as i32,
+                        draw_height as i32,
                         stride,
                         wl_shm::Format::Argb8888,
                     )
@@ -603,18 +713,21 @@ impl RawHostApp {
         let frame_ref = self.runtime.frame.as_ref();
 
         if let Some(frame) = frame_ref {
-            if frame.width == width
-                && frame.height == height
+            if frame.width == draw_width
+                && frame.height == draw_height
                 && region_covers_full_window(visible_region, width, height)
             {
                 blit_fullscreen_rgba_to_argb(canvas, frame);
-            } else if region_covers_full_window(visible_region, width, height) {
-                blit_scaled_fullscreen_rgba_to_argb(canvas, width, height, frame);
+            } else if region_covers_full_window(visible_region, width, height)
+                && draw_width == width
+                && draw_height == height
+            {
+                blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, frame);
             } else {
                 draw_frame_with_regions(
                     canvas,
-                    width,
-                    height,
+                    draw_width,
+                    draw_height,
                     frame,
                     visible_region,
                     self.runtime.transparent_outside_input_region,
@@ -623,8 +736,8 @@ impl RawHostApp {
         } else {
             draw_debug_background(
                 canvas,
-                width,
-                height,
+                draw_width,
+                draw_height,
                 &self.runtime.input_region,
                 visible_region,
                 self.runtime.show_debug_regions_when_empty,
@@ -632,14 +745,37 @@ impl RawHostApp {
             );
         }
 
+        if let Some(viewport) = self.viewport.as_ref() {
+            viewport.set_source(0.0, 0.0, draw_width as f64, draw_height as f64);
+            viewport.set_destination(width as i32, height as i32);
+        }
+
         self.window
             .wl_surface()
-            .damage_buffer(0, 0, width as i32, height as i32);
+            .damage_buffer(0, 0, draw_width as i32, draw_height as i32);
         buffer
             .attach_to(self.window.wl_surface())
             .context("failed to attach buffer to wl_surface")?;
         self.window.commit();
         Ok(())
+    }
+
+    fn preferred_buffer_size(&self) -> Option<(u32, u32)> {
+        if self.viewport.is_none() {
+            return None;
+        }
+        let visible_region = self
+            .runtime
+            .visible_region
+            .as_ref()
+            .unwrap_or(&self.runtime.input_region);
+        if !region_covers_full_window(visible_region, self.runtime.width, self.runtime.height) {
+            return None;
+        }
+        if let Some(frame) = self.runtime.frame.as_ref() {
+            return Some((frame.width, frame.height));
+        }
+        self.runtime.input_region_source_size
     }
 }
 
@@ -697,12 +833,7 @@ fn region_covers_full_window(region: &InputRegion, width: u32, height: u32) -> b
 }
 
 fn blit_fullscreen_rgba_to_argb(canvas: &mut [u8], frame: &RawHostFrame) {
-    for (src, dst) in frame.rgba.chunks_exact(4).zip(canvas.chunks_exact_mut(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
-    }
+    canvas.copy_from_slice(&frame.bgra);
 }
 
 fn blit_scaled_fullscreen_rgba_to_argb(
@@ -728,15 +859,15 @@ fn blit_scaled_fullscreen_rgba_to_argb(
     for dst_y in 0..dst_height as usize {
         let src_y = ((dst_y as u64 * frame.height as u64) / dst_height as u64)
             .min(frame.height.saturating_sub(1) as u64) as usize;
-        let src_row = &frame.rgba[src_y * src_width_usize * 4..(src_y + 1) * src_width_usize * 4];
+        let src_row = &frame.bgra[src_y * src_width_usize * 4..(src_y + 1) * src_width_usize * 4];
         let dst_row =
             &mut canvas[dst_y * dst_width_usize * 4..(dst_y + 1) * dst_width_usize * 4];
         for (dst_x, src_x) in src_x_map.iter().copied().enumerate() {
             let src_base = src_x * 4;
             let dst_base = dst_x * 4;
-            dst_row[dst_base] = src_row[src_base + 2];
+            dst_row[dst_base] = src_row[src_base];
             dst_row[dst_base + 1] = src_row[src_base + 1];
-            dst_row[dst_base + 2] = src_row[src_base];
+            dst_row[dst_base + 2] = src_row[src_base + 2];
             dst_row[dst_base + 3] = src_row[src_base + 3];
         }
     }
@@ -843,10 +974,10 @@ fn color_from_scaled_frame_or_background(
     let src_x = ((x as u32).saturating_mul(frame.width) / dst_width).min(frame.width.saturating_sub(1));
     let src_y = ((y as u32).saturating_mul(frame.height) / dst_height).min(frame.height.saturating_sub(1));
     let base = ((src_y * frame.width + src_x) * 4) as usize;
-    let r = frame.rgba[base] as u32;
-    let g = frame.rgba[base + 1] as u32;
-    let b = frame.rgba[base + 2] as u32;
-    let a = frame.rgba[base + 3] as u32;
+    let b = frame.bgra[base] as u32;
+    let g = frame.bgra[base + 1] as u32;
+    let r = frame.bgra[base + 2] as u32;
+    let a = frame.bgra[base + 3] as u32;
     argb(a, r, g, b)
 }
 
@@ -941,28 +1072,37 @@ impl WindowHandler for RawHostApp {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        self.buffer = None;
-        self.runtime.width = configure
+        let was_first_configure = self.first_configure;
+        let new_width = configure
             .new_size
             .0
             .map(|value| value.get())
             .unwrap_or(self.runtime.width);
-        self.runtime.height = configure
+        let new_height = configure
             .new_size
             .1
             .map(|value| value.get())
             .unwrap_or(self.runtime.height);
+        let size_changed = new_width != self.runtime.width || new_height != self.runtime.height;
+
+        if size_changed {
+            self.buffer = None;
+            self.runtime.width = new_width;
+            self.runtime.height = new_height;
+        }
         self.runtime.input_region = scale_input_region_to_window(
             &self.runtime.source_input_region,
             self.runtime.input_region_source_size,
             self.runtime.width,
             self.runtime.height,
         );
-        self.runtime.input_region_applied = false;
-        eprintln!(
-            "raw host configure: {}x{}",
-            self.runtime.width, self.runtime.height
-        );
+        if size_changed {
+            self.runtime.input_region_applied = false;
+            eprintln!(
+                "raw host configure: {}x{}",
+                self.runtime.width, self.runtime.height
+            );
+        }
 
         if self.runtime.fullscreen {
             self.runtime.visible_region = Some(InputRegion::from_rects(vec![InteractiveRect {
@@ -975,6 +1115,10 @@ impl WindowHandler for RawHostApp {
 
         if self.first_configure {
             self.first_configure = false;
+        }
+
+        if (!size_changed && !was_first_configure) || self.exit {
+            return;
         }
 
         if let Err(err) = self.draw() {
@@ -1257,6 +1401,27 @@ impl ProvidesRegistryState for RawHostApp {
     registry_handlers![OutputState, SeatState,];
 }
 
+impl AsMut<SimpleGlobal<WpViewporter, 1>> for RawHostApp {
+    fn as_mut(&mut self) -> &mut SimpleGlobal<WpViewporter, 1> {
+        self.viewporter
+            .as_mut()
+            .expect("wp_viewporter global requested but not bound")
+    }
+}
+
+impl Dispatch<WpViewport, ()> for RawHostApp {
+    fn event(
+        _: &mut RawHostApp,
+        _: &WpViewport,
+        _: wp_viewport::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<RawHostApp>,
+    ) {
+        unreachable!("wp_viewport::Event is empty in version 1")
+    }
+}
+
 delegate_compositor!(RawHostApp);
 delegate_output!(RawHostApp);
 delegate_shm!(RawHostApp);
@@ -1265,4 +1430,5 @@ delegate_keyboard!(RawHostApp);
 delegate_pointer!(RawHostApp);
 delegate_xdg_shell!(RawHostApp);
 delegate_xdg_window!(RawHostApp);
+delegate_simple!(RawHostApp, WpViewporter, 1);
 delegate_registry!(RawHostApp);

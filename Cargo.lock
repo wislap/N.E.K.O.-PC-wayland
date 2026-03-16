@@ -1533,6 +1533,7 @@ dependencies = [
  "smithay-client-toolkit",
  "tao",
  "wayland-client",
+ "wayland-protocols",
  "wry",
  "xkeysym",
 ]

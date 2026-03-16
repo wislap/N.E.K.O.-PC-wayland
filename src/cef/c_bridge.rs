@@ -699,10 +699,8 @@ unsafe extern "C" fn on_paint(
 
     let len = width as usize * height as usize * 4;
     let bgra = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), len) };
-    if let Ok(rgba) = bgra_to_rgba(bgra, width as u32, height as u32) {
-        if let Ok(frame) = RawHostFrame::new(width as u32, height as u32, rgba) {
-            let _ = state.raw_host.set_rgba_frame(frame);
-        }
+    if let Ok(frame) = RawHostFrame::from_bgra(width as u32, height as u32, bgra.to_vec()) {
+        let _ = state.raw_host.set_rgba_frame(frame);
     }
 }
 
@@ -711,27 +709,6 @@ fn cstr_to_string(ptr: *const c_char) -> String {
         return String::new();
     }
     unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
-}
-
-fn bgra_to_rgba(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    let expected = width as usize * height as usize * 4;
-    if bgra.len() != expected {
-        bail!(
-            "invalid BGRA buffer length {}, expected {} for {}x{}",
-            bgra.len(),
-            expected,
-            width,
-            height
-        );
-    }
-    let mut rgba = vec![0_u8; bgra.len()];
-    for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
-    }
-    Ok(rgba)
 }
 
 fn forward_pointer_event_cbridge(

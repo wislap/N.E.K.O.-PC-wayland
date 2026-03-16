@@ -91,8 +91,7 @@ impl CefRenderHandlerState {
         }
 
         log_first_paint_stats(bgra, width, height, self.transparent_painting);
-        let rgba = bgra_to_rgba(bgra, width, height)?;
-        let frame = RawHostFrame::new(width, height, rgba)?;
+        let frame = RawHostFrame::from_bgra(width, height, bgra.to_vec())?;
         self.raw_host.set_rgba_frame(frame)
     }
 
@@ -370,28 +369,6 @@ unsafe fn base_add_ref(base: *mut cef_base_ref_counted_t) {
     if let Some(add_ref) = unsafe { (*base).add_ref } {
         unsafe { add_ref(base) };
     }
-}
-
-fn bgra_to_rgba(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    let expected = width as usize * height as usize * 4;
-    if bgra.len() != expected {
-        bail!(
-            "invalid BGRA paint buffer length {}, expected {} for {}x{}",
-            bgra.len(),
-            expected,
-            width,
-            height
-        );
-    }
-
-    let mut rgba = vec![0_u8; expected];
-    for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
-    }
-    Ok(rgba)
 }
 
 fn log_first_paint_stats(bgra: &[u8], width: u32, height: u32, transparent_painting: bool) {

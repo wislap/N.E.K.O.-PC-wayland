@@ -42,7 +42,7 @@ fn run() -> anyhow::Result<()> {
         let mut tick = 0u32;
         while handle.is_running() {
             let rgba = build_demo_frame(WIDTH, HEIGHT, tick);
-            let frame = match RawHostFrame::new(WIDTH, HEIGHT, rgba) {
+            let frame = match RawHostFrame::from_rgba(WIDTH, HEIGHT, rgba) {
                 Ok(frame) => frame,
                 Err(_) => break,
             };
