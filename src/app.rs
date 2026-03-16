@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::process::Command;
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,8 +12,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use arboard::Clipboard;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use rfd::FileDialog;
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use tao::dpi::PhysicalPosition;
 use tao::window::{Window, WindowBuilder};
 #[cfg(target_os = "linux")]
 use wry::WebViewBuilderExtUnix;
@@ -31,8 +38,9 @@ use crate::frame_bridge::{
     default_frame_dump_path, duplicate_fd,
 };
 use crate::ipc::{
-    HostAction, HostEvent, InteractiveRectPayload, StrategySelectionSnapshot,
-    WaylandProfileSnapshot, build_emit_script, handle_frontend_message, init_script,
+    DisplaySnapshot, HostAction, HostCapabilitiesSnapshot, HostEvent, HostRequest,
+    InteractiveRectPayload, StrategySelectionSnapshot, WaylandProfileSnapshot,
+    WindowStateSnapshot, build_emit_script, handle_frontend_message, init_script,
 };
 use crate::launcher;
 use crate::official_helper::{OfficialHelperConfig, OfficialHelperHandle};
@@ -229,6 +237,7 @@ enum UserEvent {
     EmitToFrontend(HostEvent),
     ApplyInputRegion(InputRegion),
     ReapplyInputRegion(InputRegion),
+    HostRequest(HostRequest),
     OpenWindow(String),
     Terminate,
 }
@@ -236,6 +245,226 @@ enum UserEvent {
 struct WindowEntry {
     window: Window,
     webview: WebView,
+}
+
+fn host_capabilities() -> HostCapabilitiesSnapshot {
+    HostCapabilitiesSnapshot {
+        input_region: true,
+        screen_info: true,
+        window_state: true,
+        dark_mode: true,
+        open_external: true,
+        clipboard: true,
+        move_window: true,
+        file_dialog: true,
+    }
+}
+
+fn build_host_info_event(
+    profile: &WaylandProfile,
+    strategy: &StrategySelection,
+    dark_mode: bool,
+) -> HostEvent {
+    HostEvent::HostInfo {
+        profile: WaylandProfileSnapshot::from(profile),
+        strategy: StrategySelectionSnapshot::from(strategy),
+        capabilities: host_capabilities(),
+        dark_mode,
+    }
+}
+
+fn collect_screen_info(window: &Window) -> HostEvent {
+    let current = window.current_monitor();
+    let current_name = current.as_ref().and_then(|monitor| monitor.name());
+    let current_position = current.as_ref().map(|monitor| monitor.position());
+    let current_size = current.as_ref().map(|monitor| monitor.size());
+
+    let displays = window
+        .available_monitors()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let position = monitor.position();
+            let size = monitor.size();
+            let name = monitor.name();
+            let is_current = current_position.as_ref() == Some(&position)
+                && current_size.as_ref() == Some(&size)
+                && current_name == name;
+
+            DisplaySnapshot {
+                id: format!("display-{index}"),
+                name,
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+                scale_factor: monitor.scale_factor(),
+                is_current,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let current_display_id = displays
+        .iter()
+        .find(|display| display.is_current)
+        .map(|display| display.id.clone());
+
+    HostEvent::ScreenInfo {
+        current_display_id,
+        displays,
+    }
+}
+
+fn collect_window_state(window: &Window) -> HostEvent {
+    let position = window.outer_position().unwrap_or(tao::dpi::PhysicalPosition::new(0, 0));
+    let size = window.outer_size();
+
+    HostEvent::WindowState {
+        state: WindowStateSnapshot {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+            scale_factor: window.scale_factor(),
+            fullscreen: window.fullscreen().is_some(),
+            maximized: window.is_maximized(),
+            visible: window.is_visible(),
+            focused: window.is_focused(),
+        },
+    }
+}
+
+fn open_external_url(url: &str) -> Result<()> {
+    if url.trim().is_empty() {
+        bail!("external url must not be empty");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .with_context(|| format!("failed to launch xdg-open for {url}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!("open_external is not implemented for this platform")
+    }
+}
+
+fn read_clipboard_text() -> Result<Option<String>> {
+    let mut clipboard = Clipboard::new().context("failed to open system clipboard")?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(Some(text)),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("ContentNotAvailable") || message.contains("Clipboard") {
+                Ok(None)
+            } else {
+                Err(err).context("failed to read clipboard text")
+            }
+        }
+    }
+}
+
+fn write_clipboard_text(text: &str) -> Result<Option<String>> {
+    let mut clipboard = Clipboard::new().context("failed to open system clipboard")?;
+    clipboard
+        .set_text(text.to_string())
+        .context("failed to write clipboard text")?;
+    Ok(Some(text.to_string()))
+}
+
+fn build_file_dialog(
+    title: Option<&str>,
+    directory: Option<&str>,
+    filters: &[crate::ipc::FileDialogFilterPayload],
+) -> FileDialog {
+    let mut dialog = FileDialog::new();
+    if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(directory) = directory.filter(|value| !value.trim().is_empty()) {
+        dialog = dialog.set_directory(directory);
+    }
+    for filter in filters {
+        let extensions = filter
+            .extensions
+            .iter()
+            .map(|ext| ext.trim_start_matches('.'))
+            .filter(|ext| !ext.is_empty())
+            .collect::<Vec<_>>();
+        if !extensions.is_empty() {
+            dialog = dialog.add_filter(&filter.name, &extensions);
+        }
+    }
+    dialog
+}
+
+fn open_file_dialog(
+    directory: bool,
+    multiple: bool,
+    title: Option<&str>,
+    filters: &[crate::ipc::FileDialogFilterPayload],
+) -> Vec<String> {
+    let dialog = build_file_dialog(title, None, filters);
+    if directory {
+        return dialog
+            .pick_folder()
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+    }
+    if multiple {
+        return dialog
+            .pick_files()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+    }
+    dialog
+        .pick_file()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+fn save_file_dialog(
+    title: Option<&str>,
+    suggested_name: Option<&str>,
+    directory: Option<&str>,
+    filters: &[crate::ipc::FileDialogFilterPayload],
+) -> Option<String> {
+    let mut dialog = build_file_dialog(title, directory, filters);
+    if let Some(suggested_name) = suggested_name.filter(|value| !value.trim().is_empty()) {
+        dialog = dialog.set_file_name(suggested_name);
+    }
+    dialog.save_file().map(|path| path.display().to_string())
+}
+
+fn read_file_payload(path: &str) -> Result<HostEvent> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read file {path}"))?;
+    Ok(HostEvent::FileRead {
+        path: path.to_string(),
+        name: std::path::Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(path)
+            .to_string(),
+        content_base64: BASE64.encode(bytes),
+    })
+}
+
+fn write_file_payload(path: &str, content_base64: &str) -> Result<HostEvent> {
+    let bytes = BASE64
+        .decode(content_base64)
+        .with_context(|| format!("failed to decode base64 payload for {path}"))?;
+    fs::write(path, bytes).with_context(|| format!("failed to write file {path}"))?;
+    Ok(HostEvent::FileWriteComplete {
+        path: path.to_string(),
+    })
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
@@ -303,8 +532,6 @@ pub fn run(config: AppConfig) -> Result<()> {
         &proxy,
         &config.app_title,
         &frontend_url,
-        &profile,
-        strategy.clone(),
     )?;
     let first_window_id = first_window.window.id();
     maybe_dump_widget_tree(&first_window.window);
@@ -337,9 +564,12 @@ pub fn run(config: AppConfig) -> Result<()> {
         }
     }
 
+    let mut dark_mode_enabled = false;
     let ready_event = HostEvent::Ready {
         profile: WaylandProfileSnapshot::from(&profile),
         strategy: StrategySelectionSnapshot::from(&strategy),
+        capabilities: host_capabilities(),
+        dark_mode: dark_mode_enabled,
     };
 
     let mut launcher_runtime = Some(launcher_runtime);
@@ -356,6 +586,12 @@ pub fn run(config: AppConfig) -> Result<()> {
                             "console.error('failed to emit ready event');".to_string()
                         }),
                     );
+                    if let Ok(script) = build_emit_script(&collect_window_state(&entry.window)) {
+                        let _ = entry.webview.evaluate_script(&script);
+                    }
+                    if let Ok(script) = build_emit_script(&collect_screen_info(&entry.window)) {
+                        let _ = entry.webview.evaluate_script(&script);
+                    }
                 }
             }
             Event::UserEvent(user_event) => match user_event {
@@ -414,6 +650,114 @@ pub fn run(config: AppConfig) -> Result<()> {
                         }
                     }
                 }
+                UserEvent::HostRequest(request) => {
+                    let main_window = windows
+                        .get(&first_window_id)
+                        .or_else(|| windows.values().next())
+                        .map(|entry| &entry.window);
+
+                    let event = match request {
+                        HostRequest::GetHostInfo => {
+                            Some(build_host_info_event(&profile, &strategy, dark_mode_enabled))
+                        }
+                        HostRequest::GetScreenInfo => {
+                            main_window.map(collect_screen_info)
+                        }
+                        HostRequest::GetWindowState => {
+                            main_window.map(collect_window_state)
+                        }
+                        HostRequest::GetDarkMode => {
+                            Some(HostEvent::DarkModeChanged {
+                                enabled: dark_mode_enabled,
+                            })
+                        }
+                        HostRequest::SetDarkMode { enabled } => {
+                            dark_mode_enabled = enabled;
+                            Some(HostEvent::DarkModeChanged { enabled })
+                        }
+                        HostRequest::OpenExternal { url } => {
+                            match open_external_url(&url) {
+                                Ok(()) => Some(HostEvent::ExternalOpened { url }),
+                                Err(err) => Some(HostEvent::Error {
+                                    message: format!("failed to open external url: {err}"),
+                                }),
+                            }
+                        }
+                        HostRequest::GetClipboardText => match read_clipboard_text() {
+                            Ok(text) => Some(HostEvent::ClipboardText { text }),
+                            Err(err) => Some(HostEvent::Error {
+                                message: format!("failed to read clipboard text: {err}"),
+                            }),
+                        },
+                        HostRequest::SetClipboardText { text } => {
+                            match write_clipboard_text(&text) {
+                                Ok(text) => Some(HostEvent::ClipboardText { text }),
+                                Err(err) => Some(HostEvent::Error {
+                                    message: format!("failed to write clipboard text: {err}"),
+                                }),
+                            }
+                        }
+                        HostRequest::MoveWindowToDisplay { screen_x, screen_y } => {
+                            if let Some(window) = main_window {
+                                window.set_outer_position(PhysicalPosition::new(screen_x, screen_y));
+                                Some(collect_window_state(window))
+                            } else {
+                                Some(HostEvent::Error {
+                                    message: "no active window available to move".to_string(),
+                                })
+                            }
+                        }
+                        HostRequest::OpenFileDialog {
+                            directory,
+                            multiple,
+                            title,
+                            filters,
+                        } => Some(HostEvent::FileDialogResult {
+                            paths: open_file_dialog(
+                                directory,
+                                multiple,
+                                title.as_deref(),
+                                &filters,
+                            ),
+                        }),
+                        HostRequest::SaveFileDialog {
+                            title,
+                            suggested_name,
+                            directory,
+                            filters,
+                        } => Some(HostEvent::SaveDialogResult {
+                            path: save_file_dialog(
+                                title.as_deref(),
+                                suggested_name.as_deref(),
+                                directory.as_deref(),
+                                &filters,
+                            ),
+                        }),
+                        HostRequest::ReadFile { path } => match read_file_payload(&path) {
+                            Ok(event) => Some(event),
+                            Err(err) => Some(HostEvent::Error {
+                                message: format!("failed to read file: {err}"),
+                            }),
+                        },
+                        HostRequest::WriteFile {
+                            path,
+                            content_base64,
+                        } => match write_file_payload(&path, &content_base64) {
+                            Ok(event) => Some(event),
+                            Err(err) => Some(HostEvent::Error {
+                                message: format!("failed to write file: {err}"),
+                            }),
+                        },
+                    };
+
+                    if let Some(event) = event {
+                        if let Ok(script) = build_emit_script(&event) {
+                            for entry in windows.values() {
+                                let _ = entry.webview.evaluate_script(&script);
+                            }
+                        }
+                    }
+                }
                 UserEvent::ReapplyInputRegion(region) => {
                     if let Some(handle) = raw_host_handle.as_ref() {
                         if let Err(err) = handle.set_input_region(region.clone()) {
@@ -435,8 +779,6 @@ pub fn run(config: AppConfig) -> Result<()> {
                         &proxy,
                         &config.app_title,
                         &url,
-                        &profile,
-                        strategy.clone(),
                     ) {
                         Ok(entry) => {
                             maybe_dump_widget_tree(&entry.window);
@@ -483,6 +825,42 @@ pub fn run(config: AppConfig) -> Result<()> {
                         runtime.handle.terminate();
                     }
                     *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::WindowEvent {
+                event,
+                window_id,
+                ..
+            } => {
+                let should_emit_window_state = matches!(
+                    event,
+                    WindowEvent::Moved(_)
+                        | WindowEvent::Resized(_)
+                        | WindowEvent::Focused(_)
+                        | WindowEvent::ScaleFactorChanged { .. }
+                );
+                let should_emit_screen_info = matches!(
+                    event,
+                    WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+                );
+
+                if should_emit_window_state || should_emit_screen_info {
+                    if let Some(entry) = windows.get(&window_id) {
+                        if should_emit_window_state {
+                            if let Ok(script) = build_emit_script(&collect_window_state(&entry.window)) {
+                                for window_entry in windows.values() {
+                                    let _ = window_entry.webview.evaluate_script(&script);
+                                }
+                            }
+                        }
+                        if should_emit_screen_info {
+                            if let Ok(script) = build_emit_script(&collect_screen_info(&entry.window)) {
+                                for window_entry in windows.values() {
+                                    let _ = window_entry.webview.evaluate_script(&script);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1298,17 +1676,18 @@ fn install_signal_handler(proxy: EventLoopProxy<UserEvent>) -> Result<()> {
 
 fn make_ipc_handler(
     proxy: EventLoopProxy<UserEvent>,
-    profile: WaylandProfile,
-    strategy: crate::wayland::engine::StrategySelection,
 ) -> impl Fn(wry::http::Request<String>) + 'static {
     move |request| {
         let body = request.body();
-        match handle_frontend_message(body, &profile, &strategy) {
+        match handle_frontend_message(body) {
             HostAction::Emit(event) => {
                 let _ = proxy.send_event(UserEvent::EmitToFrontend(event));
             }
             HostAction::ApplyInputRegion(region) => {
                 let _ = proxy.send_event(UserEvent::ApplyInputRegion(region));
+            }
+            HostAction::Request(request) => {
+                let _ = proxy.send_event(UserEvent::HostRequest(request));
             }
         }
     }
@@ -1319,8 +1698,6 @@ fn create_window(
     proxy: &EventLoopProxy<UserEvent>,
     app_title: &str,
     url: &str,
-    profile: &WaylandProfile,
-    strategy: StrategySelection,
 ) -> Result<WindowEntry> {
     let window = WindowBuilder::new()
         .with_title(app_title)
@@ -1335,11 +1712,7 @@ fn create_window(
         .with_url(url)
         .with_transparent(true)
         .with_initialization_script(init_script())
-        .with_ipc_handler(make_ipc_handler(
-            proxy.clone(),
-            profile.clone(),
-            strategy.clone(),
-        ))
+        .with_ipc_handler(make_ipc_handler(proxy.clone()))
         .with_new_window_req_handler(move |requested_url, _features| {
             let _ = new_window_proxy.send_event(UserEvent::OpenWindow(requested_url));
             NewWindowResponse::Deny

@@ -299,7 +299,7 @@ fn run_inner_with_running(
         EventLoop::try_new().context("failed to create calloop event loop")?;
     WaylandSource::new(conn.clone(), event_queue)
         .insert(event_loop.handle())
-        .context("failed to insert Wayland source into event loop")?;
+        .map_err(|err| anyhow::anyhow!("failed to insert Wayland source into event loop: {err}"))?;
 
     let compositor =
         CompositorState::bind(&globals, &qh).context("wl_compositor is not available")?;
