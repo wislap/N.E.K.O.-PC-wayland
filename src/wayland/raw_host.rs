@@ -47,6 +47,7 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewporter::WpViewporter,
 };
 
+use crate::frame_bridge::SharedFrameReader;
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
 
 #[derive(Debug, Clone)]
@@ -216,11 +217,13 @@ pub fn run(config: RawHostConfig) -> Result<()> {
 pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
     let (sender, receiver) = channel::<RawHostCommand>();
     let running = Arc::new(AtomicBool::new(true));
+    let surface_size = Arc::new(Mutex::new((config.width, config.height)));
     let latest_frame = Arc::new(Mutex::new(None));
     let frame_update_pending = Arc::new(AtomicBool::new(false));
     let pointer_subscribers = Arc::new(Mutex::new(Vec::new()));
     let keyboard_subscribers = Arc::new(Mutex::new(Vec::new()));
     let thread_running = Arc::clone(&running);
+    let thread_surface_size = Arc::clone(&surface_size);
     let thread_latest_frame = Arc::clone(&latest_frame);
     let thread_frame_update_pending = Arc::clone(&frame_update_pending);
     let thread_pointer_subscribers = Arc::clone(&pointer_subscribers);
@@ -232,6 +235,7 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
                 config,
                 Some(receiver),
                 thread_running,
+                thread_surface_size,
                 thread_latest_frame,
                 thread_frame_update_pending,
                 thread_pointer_subscribers,
@@ -244,6 +248,7 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
         handle: RawHostHandle {
             sender,
             running,
+            surface_size,
             latest_frame,
             frame_update_pending,
             pointer_subscribers,
@@ -258,12 +263,14 @@ fn run_inner(
     commands: Option<smithay_client_toolkit::reexports::calloop::channel::Channel<RawHostCommand>>,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
+    let surface_size = Arc::new(Mutex::new((config.width, config.height)));
     let latest_frame = Arc::new(Mutex::new(None));
     let frame_update_pending = Arc::new(AtomicBool::new(false));
     run_inner_with_running(
         config,
         commands,
         running,
+        surface_size,
         latest_frame,
         frame_update_pending,
         Arc::new(Mutex::new(Vec::new())),
@@ -275,6 +282,7 @@ fn run_inner_with_running(
     config: RawHostConfig,
     commands: Option<smithay_client_toolkit::reexports::calloop::channel::Channel<RawHostCommand>>,
     running: Arc<AtomicBool>,
+    surface_size: Arc<Mutex<(u32, u32)>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
@@ -352,6 +360,8 @@ fn run_inner_with_running(
             ),
             visible_region: config.visible_region.clone(),
             frame: None,
+            shared_frame_reader: None,
+            shared_frame: None,
             input_region_applied: false,
             transparent_outside_input_region: config.transparent_outside_input_region,
             show_debug_regions_when_empty: config.show_debug_regions_when_empty,
@@ -366,6 +376,7 @@ fn run_inner_with_running(
         keyboard: None,
         pointer_inside: false,
         running,
+        surface_size,
         latest_frame,
         frame_update_pending,
         pointer_subscribers,
@@ -434,6 +445,7 @@ impl RawHostThread {
 pub struct RawHostHandle {
     sender: ChannelSender<RawHostCommand>,
     running: Arc<AtomicBool>,
+    surface_size: Arc<Mutex<(u32, u32)>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
@@ -444,19 +456,31 @@ impl RawHostHandle {
     pub fn set_input_region(&self, region: InputRegion) -> Result<()> {
         self.sender
             .send(RawHostCommand::SetInputRegion(region))
-            .context("failed to send input-region update to raw host")
+            .map_err(|err| anyhow!("failed to send input-region update to raw host: {err}"))
     }
 
     pub fn set_visible_region(&self, region: Option<InputRegion>) -> Result<()> {
         self.sender
             .send(RawHostCommand::SetVisibleRegion(region))
-            .context("failed to send visible-region update to raw host")
+            .map_err(|err| anyhow!("failed to send visible-region update to raw host: {err}"))
     }
 
     pub fn shutdown(&self) -> Result<()> {
         self.sender
             .send(RawHostCommand::Shutdown)
-            .context("failed to send shutdown command to raw host")
+            .map_err(|err| anyhow!("failed to send shutdown command to raw host: {err}"))
+    }
+
+    pub fn attach_shared_frame_reader(&self, reader: SharedFrameReader) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::AttachSharedFrameReader(reader))
+            .map_err(|err| anyhow!("failed to attach shared frame reader to raw host: {err}"))
+    }
+
+    pub fn refresh_shared_frame(&self, width: u32, height: u32) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::RefreshSharedFrame { width, height })
+            .map_err(|err| anyhow!("failed to request shared frame refresh in raw host: {err}"))
     }
 
     pub fn set_rgba_frame(&self, frame: RawHostFrame) -> Result<()> {
@@ -470,7 +494,7 @@ impl RawHostHandle {
         if !self.frame_update_pending.swap(true, Ordering::SeqCst) {
             self.sender
                 .send(RawHostCommand::FrameReady)
-                .context("failed to notify raw host about latest frame")?;
+                .map_err(|err| anyhow!("failed to notify raw host about latest frame: {err}"))?;
         }
         Ok(())
     }
@@ -478,11 +502,18 @@ impl RawHostHandle {
     pub fn clear_frame(&self) -> Result<()> {
         self.sender
             .send(RawHostCommand::ClearFrame)
-            .context("failed to clear RGBA frame in raw host")
+            .map_err(|err| anyhow!("failed to clear RGBA frame in raw host: {err}"))
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn surface_size(&self) -> (u32, u32) {
+        *self
+            .surface_size
+            .lock()
+            .expect("surface size mutex poisoned")
     }
 
     pub fn subscribe_pointer_events(&self) -> Receiver<RawHostPointerEvent> {
@@ -508,6 +539,11 @@ impl RawHostHandle {
 enum RawHostCommand {
     SetInputRegion(InputRegion),
     SetVisibleRegion(Option<InputRegion>),
+    AttachSharedFrameReader(SharedFrameReader),
+    RefreshSharedFrame {
+        width: u32,
+        height: u32,
+    },
     FrameReady,
     ClearFrame,
     Shutdown,
@@ -523,6 +559,8 @@ struct RawHostRuntime {
     input_region: InputRegion,
     visible_region: Option<InputRegion>,
     frame: Option<RawHostFrame>,
+    shared_frame_reader: Option<SharedFrameReader>,
+    shared_frame: Option<RawHostFrame>,
     input_region_applied: bool,
     transparent_outside_input_region: bool,
     show_debug_regions_when_empty: bool,
@@ -549,6 +587,7 @@ struct RawHostApp {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer_inside: bool,
     running: Arc<AtomicBool>,
+    surface_size: Arc<Mutex<(u32, u32)>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
@@ -590,6 +629,12 @@ impl RawHostApp {
                 self.runtime.visible_region = region;
                 self.draw()?;
             }
+            RawHostCommand::AttachSharedFrameReader(reader) => {
+                self.runtime.shared_frame_reader = Some(reader);
+            }
+            RawHostCommand::RefreshSharedFrame { width, height } => {
+                self.refresh_shared_frame(width, height)?;
+            }
             RawHostCommand::FrameReady => {
                 self.consume_latest_frame()?;
             }
@@ -599,6 +644,7 @@ impl RawHostApp {
                     latest_frame.take();
                 }
                 self.runtime.frame = None;
+                self.runtime.shared_frame = None;
                 self.draw()?;
             }
             RawHostCommand::Shutdown => {
@@ -621,6 +667,7 @@ impl RawHostApp {
 
             if let Some(frame) = next_frame {
                 self.runtime.frame = Some(frame);
+                self.runtime.shared_frame = None;
                 self.draw()?;
             }
 
@@ -638,6 +685,25 @@ impl RawHostApp {
         Ok(())
     }
 
+    fn refresh_shared_frame(&mut self, width: u32, height: u32) -> Result<()> {
+        let Some(reader) = self.runtime.shared_frame_reader.as_ref() else {
+            return Ok(());
+        };
+
+        let mut frame = self.runtime.shared_frame.take().unwrap_or(RawHostFrame {
+            width,
+            height,
+            bgra: Vec::new(),
+        });
+        let (loaded_width, loaded_height) =
+            reader.load_latest_into(&mut frame.bgra, width, height)?;
+        frame.width = loaded_width;
+        frame.height = loaded_height;
+        self.runtime.shared_frame = Some(frame);
+        self.runtime.frame = None;
+        self.draw()
+    }
+
     fn apply_input_region(&mut self) -> Result<()> {
         let region = Region::new(&self.compositor_state).context("failed to create wl_region")?;
         for rect in self.runtime.input_region.rects() {
@@ -651,11 +717,13 @@ impl RawHostApp {
         self.window.set_input_region(Some(region.wl_region()));
         self.window.commit();
         self.runtime.input_region_applied = true;
-        eprintln!(
-            "applied raw wl_surface input-region with {} rect(s): {:?}",
-            self.runtime.input_region.rects().len(),
-            self.runtime.input_region.rects()
-        );
+        if self.runtime.log_pointer_events {
+            eprintln!(
+                "applied raw wl_surface input-region with {} rect(s): {:?}",
+                self.runtime.input_region.rects().len(),
+                self.runtime.input_region.rects()
+            );
+        }
         Ok(())
     }
 
@@ -710,7 +778,11 @@ impl RawHostApp {
             .visible_region
             .as_ref()
             .unwrap_or(&self.runtime.input_region);
-        let frame_ref = self.runtime.frame.as_ref();
+        let frame_ref = self
+            .runtime
+            .frame
+            .as_ref()
+            .or(self.runtime.shared_frame.as_ref());
 
         if let Some(frame) = frame_ref {
             if frame.width == draw_width
@@ -1089,6 +1161,9 @@ impl WindowHandler for RawHostApp {
             self.buffer = None;
             self.runtime.width = new_width;
             self.runtime.height = new_height;
+            if let Ok(mut surface_size) = self.surface_size.lock() {
+                *surface_size = (new_width, new_height);
+            }
         }
         self.runtime.input_region = scale_input_region_to_window(
             &self.runtime.source_input_region,
@@ -1098,10 +1173,12 @@ impl WindowHandler for RawHostApp {
         );
         if size_changed {
             self.runtime.input_region_applied = false;
-            eprintln!(
-                "raw host configure: {}x{}",
-                self.runtime.width, self.runtime.height
-            );
+            if self.runtime.log_pointer_events {
+                eprintln!(
+                    "raw host configure: {}x{}",
+                    self.runtime.width, self.runtime.height
+                );
+            }
         }
 
         if self.runtime.fullscreen {
@@ -1145,7 +1222,9 @@ impl SeatHandler for RawHostApp {
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
                 Ok(pointer) => {
-                    eprintln!("pointer capability acquired");
+                    if self.runtime.log_pointer_events {
+                        eprintln!("pointer capability acquired");
+                    }
                     self.pointer = Some(pointer);
                 }
                 Err(err) => eprintln!("failed to create pointer: {err}"),
@@ -1155,7 +1234,9 @@ impl SeatHandler for RawHostApp {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             match self.seat_state.get_keyboard(qh, &seat, None) {
                 Ok(keyboard) => {
-                    eprintln!("keyboard capability acquired");
+                    if self.runtime.log_pointer_events {
+                        eprintln!("keyboard capability acquired");
+                    }
                     self.keyboard = Some(keyboard);
                 }
                 Err(err) => eprintln!("failed to create keyboard: {err}"),
@@ -1197,7 +1278,9 @@ impl KeyboardHandler for RawHostApp {
         _: &[u32],
         keysyms: &[Keysym],
     ) {
-        eprintln!("keyboard enter: pressed={keysyms:?}");
+        if self.runtime.log_pointer_events {
+            eprintln!("keyboard enter: pressed={keysyms:?}");
+        }
     }
 
     fn leave(
@@ -1208,7 +1291,9 @@ impl KeyboardHandler for RawHostApp {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
-        eprintln!("keyboard leave");
+        if self.runtime.log_pointer_events {
+            eprintln!("keyboard leave");
+        }
     }
 
     fn press_key(
@@ -1225,7 +1310,9 @@ impl KeyboardHandler for RawHostApp {
             utf8: event.utf8.clone(),
             modifiers: self.modifiers,
         });
-        eprintln!("key press: {event:?}");
+        if self.runtime.log_pointer_events {
+            eprintln!("key press: {event:?}");
+        }
     }
 
     fn repeat_key(
@@ -1242,7 +1329,9 @@ impl KeyboardHandler for RawHostApp {
             utf8: event.utf8.clone(),
             modifiers: self.modifiers,
         });
-        eprintln!("key repeat: {event:?}");
+        if self.runtime.log_pointer_events {
+            eprintln!("key repeat: {event:?}");
+        }
     }
 
     fn release_key(
@@ -1258,7 +1347,9 @@ impl KeyboardHandler for RawHostApp {
             keysym: event.keysym.raw(),
             modifiers: self.modifiers,
         });
-        eprintln!("key release: {event:?}");
+        if self.runtime.log_pointer_events {
+            eprintln!("key release: {event:?}");
+        }
     }
 
     fn update_modifiers(
@@ -1279,7 +1370,9 @@ impl KeyboardHandler for RawHostApp {
             logo: modifiers.logo,
             num_lock: modifiers.num_lock,
         };
-        eprintln!("modifiers changed: {modifiers:?}");
+        if self.runtime.log_pointer_events {
+            eprintln!("modifiers changed: {modifiers:?}");
+        }
     }
 }
 

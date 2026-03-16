@@ -77,16 +77,28 @@ typedef struct _neko_cef_standalone_state_t {
 typedef struct _neko_shared_frame_header_t {
   uint32_t magic;
   uint32_t version;
+  uint32_t slot_count;
+  uint32_t latest_slot;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+  uint32_t reserved3;
+} neko_shared_frame_root_header_t;
+
+typedef struct _neko_shared_frame_slot_header_t {
   uint32_t seq;
   uint32_t frame;
   uint32_t width;
   uint32_t height;
   uint32_t stride;
   uint32_t data_len;
-} neko_shared_frame_header_t;
+  uint32_t reserved0;
+  uint32_t reserved1;
+} neko_shared_frame_slot_header_t;
 
 #define NEKO_SHARED_FRAME_MAGIC 0x4E4B4642u
 #define NEKO_SHARED_FRAME_VERSION 1u
+#define NEKO_SHARED_FRAME_SLOT_COUNT 3u
 
 extern int neko_cef_bridge_execute_process(int argc, char** argv, int use_app);
 extern neko_cef_runtime_t* neko_cef_bridge_initialize(
@@ -670,9 +682,13 @@ static void maybe_write_shared_frame(neko_cef_standalone_state_t* state,
                                      const void* buffer,
                                      int width,
                                      int height) {
-  neko_shared_frame_header_t* header;
+  neko_shared_frame_root_header_t* root;
+  neko_shared_frame_slot_header_t* header;
   size_t data_len;
+  size_t slot_size;
+  size_t slot_offset;
   uint8_t* payload;
+  uint32_t slot_index;
 
   if (!state || !state->shared_frame_map || state->shared_frame_map_len < sizeof(*header) || !buffer ||
       width <= 0 || height <= 0) {
@@ -680,22 +696,27 @@ static void maybe_write_shared_frame(neko_cef_standalone_state_t* state,
   }
 
   data_len = (size_t)width * (size_t)height * 4u;
-  if (sizeof(*header) + data_len > state->shared_frame_map_len) {
+  slot_size = sizeof(*header) + data_len;
+  if (sizeof(*root) + slot_size * NEKO_SHARED_FRAME_SLOT_COUNT > state->shared_frame_map_len) {
     fprintf(stderr,
             "NEKO_CEF_STANDALONE shared frame too small: map=%zu need=%zu\n",
             state->shared_frame_map_len,
-            sizeof(*header) + data_len);
+            sizeof(*root) + slot_size * NEKO_SHARED_FRAME_SLOT_COUNT);
     fflush(stderr);
     return;
   }
 
-  header = (neko_shared_frame_header_t*)state->shared_frame_map;
-  payload = (uint8_t*)state->shared_frame_map + sizeof(*header);
+  root = (neko_shared_frame_root_header_t*)state->shared_frame_map;
+  root->magic = NEKO_SHARED_FRAME_MAGIC;
+  root->version = NEKO_SHARED_FRAME_VERSION;
+  root->slot_count = NEKO_SHARED_FRAME_SLOT_COUNT;
+  slot_index = (uint32_t)(state->frame_count % (int)NEKO_SHARED_FRAME_SLOT_COUNT);
+  slot_offset = sizeof(*root) + slot_size * slot_index;
+  header = (neko_shared_frame_slot_header_t*)((uint8_t*)state->shared_frame_map + slot_offset);
+  payload = (uint8_t*)header + sizeof(*header);
 
   __sync_add_and_fetch(&header->seq, 1);
   __sync_synchronize();
-  header->magic = NEKO_SHARED_FRAME_MAGIC;
-  header->version = NEKO_SHARED_FRAME_VERSION;
   header->frame = (uint32_t)(state ? state->frame_count : 0);
   header->width = (uint32_t)width;
   header->height = (uint32_t)height;
@@ -704,6 +725,8 @@ static void maybe_write_shared_frame(neko_cef_standalone_state_t* state,
   memcpy(payload, buffer, data_len);
   __sync_synchronize();
   __sync_add_and_fetch(&header->seq, 1);
+  __sync_synchronize();
+  root->latest_slot = slot_index;
 }
 
 static void on_paint(void* user_data,

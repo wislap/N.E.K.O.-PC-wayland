@@ -45,6 +45,7 @@ use crate::wayland::engine::{
 };
 use crate::wayland::input_region::InputRegion;
 use crate::wayland::raw_host::{RawHostConfig, RawHostHandle, spawn as spawn_raw_host};
+use crate::wayland::raw_host::RawHostPointerEvent;
 
 fn verbose_paint_trace_enabled() -> bool {
     matches!(
@@ -55,6 +56,20 @@ fn verbose_paint_trace_enabled() -> bool {
             .as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+fn clamp_cef_frame_rate(frame_rate: u32) -> u32 {
+    frame_rate.clamp(1, 60)
+}
+
+fn helper_loop_sleep_ms(frame_rate: u32) -> u32 {
+    let frame_rate = frame_rate.max(1);
+    (1000 / frame_rate).clamp(1, 8)
+}
+
+fn helper_event_wait_ms(frame_rate: u32) -> u64 {
+    let frame_rate = frame_rate.max(1);
+    u64::from((1000 / frame_rate).clamp(1, 8))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,8 +84,12 @@ struct FramePumpHandle {
     sender: SyncSender<FramePumpRequest>,
 }
 
+enum FrameDelivery {
+    Shared,
+    Pump(FramePumpHandle),
+}
+
 enum FramePumpSource {
-    Shared(SharedFrameReader),
     File {
         path: std::path::PathBuf,
         reader: Option<FrameReader>,
@@ -98,9 +117,6 @@ fn spawn_frame_pump(raw_host: RawHostHandle, mut source: FramePumpSource) -> Fra
                 }
 
                 let frame_result = match &mut source {
-                    FramePumpSource::Shared(reader) => {
-                        reader.load_latest_frame(request.width, request.height)
-                    }
                     FramePumpSource::File { path, reader } => {
                         if reader.is_none() {
                             match FrameReader::open(&*path) {
@@ -134,15 +150,12 @@ fn spawn_frame_pump(raw_host: RawHostHandle, mut source: FramePumpSource) -> Fra
                         }
                     }
                     Err(err) => {
-                        if let FramePumpSource::File { reader, path } = &mut source {
-                            *reader = None;
-                            eprintln!(
-                                "frame pump failed to load dumped CEF frame {}: {err:#}",
-                                path.display()
-                            );
-                        } else if verbose_paint_trace_enabled() || request.frame <= 3 {
-                            eprintln!("frame pump failed to load shared CEF frame: {err:#}");
-                        }
+                        let FramePumpSource::File { reader, path } = &mut source;
+                        *reader = None;
+                        eprintln!(
+                            "frame pump failed to load dumped CEF frame {}: {err:#}",
+                            path.display()
+                        );
                     }
                 }
 
@@ -156,6 +169,59 @@ fn spawn_frame_pump(raw_host: RawHostHandle, mut source: FramePumpSource) -> Fra
         })
         .expect("failed to spawn frame pump thread");
     FramePumpHandle { sender }
+}
+
+fn scale_pointer_event_to_render_space(
+    event: RawHostPointerEvent,
+    window_size: (u32, u32),
+    render_size: (u32, u32),
+) -> RawHostPointerEvent {
+    fn scale(value: f64, src: u32, dst: u32) -> f64 {
+        if src == 0 || dst == 0 {
+            return value;
+        }
+        value * f64::from(dst) / f64::from(src)
+    }
+
+    let (window_width, window_height) = window_size;
+    let (render_width, render_height) = render_size;
+
+    match event {
+        RawHostPointerEvent::Enter { x, y } => RawHostPointerEvent::Enter {
+            x: scale(x, window_width, render_width),
+            y: scale(y, window_height, render_height),
+        },
+        RawHostPointerEvent::Leave { x, y } => RawHostPointerEvent::Leave {
+            x: scale(x, window_width, render_width),
+            y: scale(y, window_height, render_height),
+        },
+        RawHostPointerEvent::Motion { x, y } => RawHostPointerEvent::Motion {
+            x: scale(x, window_width, render_width),
+            y: scale(y, window_height, render_height),
+        },
+        RawHostPointerEvent::Button {
+            x,
+            y,
+            button,
+            pressed,
+        } => RawHostPointerEvent::Button {
+            x: scale(x, window_width, render_width),
+            y: scale(y, window_height, render_height),
+            button,
+            pressed,
+        },
+        RawHostPointerEvent::Wheel {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => RawHostPointerEvent::Wheel {
+            x: scale(x, window_width, render_width),
+            y: scale(y, window_height, render_height),
+            delta_x: scale(delta_x, window_width, render_width),
+            delta_y: scale(delta_y, window_height, render_height),
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -451,7 +517,7 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
     cef_config.height = 600;
     cef_config.url = frontend_url;
     cef_config.transparent_painting = false;
-    cef_config.frame_rate = 30;
+    cef_config.frame_rate = clamp_cef_frame_rate(30);
 
     install_event_callback(|event| match event {
         CefLifecycleEvent::BrowserCreated => {
@@ -732,6 +798,13 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
         ],
     );
     eprintln!("loading frontend url: {frontend_url}");
+    let effective_render_fps = clamp_cef_frame_rate(config.render_fps);
+    if effective_render_fps != config.render_fps {
+        eprintln!(
+            "requested render fps {} is above CEF OSR limit; clamping to {}",
+            config.render_fps, effective_render_fps
+        );
+    }
 
     let raw_host = spawn_raw_host(build_raw_cef_host_config(config, false))
         .context("failed to spawn raw host for C standalone probe")?;
@@ -743,19 +816,26 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
         .with_url(frontend_url)
         .with_env("NEKO_CEF_HELPER_WIDTH", config.render_width.to_string())
         .with_env("NEKO_CEF_HELPER_HEIGHT", config.render_height.to_string())
-        .with_env("NEKO_CEF_HELPER_FRAME_RATE", config.render_fps.to_string())
+        .with_env("NEKO_CEF_HELPER_FRAME_RATE", effective_render_fps.to_string())
+        .with_env(
+            "NEKO_CEF_HELPER_LOOP_SLEEP_MS",
+            helper_loop_sleep_ms(config.render_fps).to_string(),
+        )
         .with_env(
             "NEKO_CEF_HELPER_TRANSPARENT",
             if config.transparent_background { "1" } else { "0" },
         );
     let mut shared_frame_writer = None;
-    let frame_pump = match create_shared_frame_writer(config.render_width, config.render_height) {
+    let frame_delivery = match create_shared_frame_writer(config.render_width, config.render_height) {
         Ok(shared_writer) => {
             let reader = SharedFrameReader::open(SharedFrameReaderConfig {
                 fd: duplicate_fd(shared_writer.fd.as_raw_fd())?,
                 size: shared_writer.size,
             })
             .context("failed to open shared frame reader")?;
+            raw_host_handle
+                .attach_shared_frame_reader(reader)
+                .context("failed to attach shared frame reader to raw host")?;
             helper_config = helper_config
                 .with_env("NEKO_CEF_SHARED_FRAME_FD", shared_writer.fd.as_raw_fd().to_string())
                 .with_env("NEKO_CEF_SHARED_FRAME_SIZE", shared_writer.size.to_string());
@@ -767,7 +847,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 config.render_height
             );
             shared_frame_writer = Some(shared_writer);
-            spawn_frame_pump(raw_host_handle.clone(), FramePumpSource::Shared(reader))
+            FrameDelivery::Shared
         }
         Err(err) => {
             let frame_dump_path = default_frame_dump_path();
@@ -779,13 +859,13 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 "shared frame bridge unavailable, falling back to file bridge {}: {err:#}",
                 frame_dump_path.display()
             );
-            spawn_frame_pump(
+            FrameDelivery::Pump(spawn_frame_pump(
                 raw_host_handle.clone(),
                 FramePumpSource::File {
                     path: frame_dump_path,
                     reader: None,
                 },
-            )
+            ))
         }
     };
     eprintln!(
@@ -794,7 +874,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
         helper_config.runtime_dir.display(),
         config.render_width,
         config.render_height,
-        config.render_fps,
+        effective_render_fps,
         config.window_width,
         config.window_height,
         config.fullscreen
@@ -814,8 +894,9 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
     let mut last_frame_push_at = None::<Instant>;
     let mut last_frontend_input_region = None::<InputRegion>;
     let frame_push_interval = Duration::from_millis(
-        (1000_u64 / u64::from(config.render_fps.max(1))).max(1),
+        (1000_u64 / u64::from(effective_render_fps.max(1))).max(1),
     );
+    let helper_event_wait = Duration::from_millis(helper_event_wait_ms(config.render_fps));
     let mut helper_shutdown_started = false;
     let mut helper_shutdown_deadline = None::<Instant>;
 
@@ -839,6 +920,11 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
             loop {
                 match pointer_events.try_recv() {
                     Ok(event) => {
+                        let event = scale_pointer_event_to_render_space(
+                            event,
+                            raw_host_handle.surface_size(),
+                            (config.render_width, config.render_height),
+                        );
                         if let Err(err) =
                             helper.send_pointer_event(event, &mut mouse_modifiers, key_modifiers)
                         {
@@ -870,7 +956,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
             }
         }
 
-        if let Some(event) = helper.recv_event_timeout(Duration::from_millis(16))? {
+        if let Some(event) = helper.recv_event_timeout(helper_event_wait)? {
             apply_c_standalone_event(
                 event,
                 &mut saw_initialize_ok,
@@ -880,7 +966,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 frame_push_interval,
                 &mut last_frame_push_at,
                 &mut last_frontend_input_region,
-                Some((&raw_host_handle, &frame_pump)),
+                Some((&raw_host_handle, &frame_delivery)),
             )?;
         }
 
@@ -894,7 +980,7 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 frame_push_interval,
                 &mut last_frame_push_at,
                 &mut last_frontend_input_region,
-                Some((&raw_host_handle, &frame_pump)),
+                Some((&raw_host_handle, &frame_delivery)),
             )?;
             let _ = raw_host_handle.shutdown();
             if let Some(mut runtime) = launcher_runtime.take() {
@@ -964,7 +1050,7 @@ fn drain_c_standalone_events(
     frame_push_interval: Duration,
     last_frame_push_at: &mut Option<Instant>,
     last_frontend_input_region: &mut Option<InputRegion>,
-    frame_sink: Option<(&RawHostHandle, &FramePumpHandle)>,
+    frame_sink: Option<(&RawHostHandle, &FrameDelivery)>,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
@@ -995,7 +1081,7 @@ fn apply_c_standalone_event(
     frame_push_interval: Duration,
     last_frame_push_at: &mut Option<Instant>,
     last_frontend_input_region: &mut Option<InputRegion>,
-    frame_sink: Option<(&RawHostHandle, &FramePumpHandle)>,
+    frame_sink: Option<(&RawHostHandle, &FrameDelivery)>,
 ) -> Result<()> {
     match event {
         CStandaloneHelperEvent::Startup => {
@@ -1044,16 +1130,23 @@ fn apply_c_standalone_event(
                     width, height
                 );
             }
-            if let Some((_raw_host, frame_pump)) = frame_sink {
-                frame_pump.request(FramePumpRequest {
-                    width: width as u32,
-                    height: height as u32,
-                    frame,
-                });
+            if let Some((raw_host, frame_delivery)) = frame_sink {
+                match frame_delivery {
+                    FrameDelivery::Shared => {
+                        raw_host.refresh_shared_frame(width as u32, height as u32)?;
+                    }
+                    FrameDelivery::Pump(frame_pump) => {
+                        frame_pump.request(FramePumpRequest {
+                            width: width as u32,
+                            height: height as u32,
+                            frame,
+                        });
+                    }
+                }
                 *last_frame_push_at = Some(now);
                 if frame <= 2 {
                     eprintln!(
-                        "queued dumped CEF frame into frame pump: size={}x{} frame={frame}",
+                        "queued CEF frame for presentation: size={}x{} frame={frame}",
                         width, height
                     );
                 }
