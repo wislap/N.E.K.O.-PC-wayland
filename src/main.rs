@@ -9,6 +9,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    #[cfg(feature = "cef_osr")]
+    if let Some(code) = neko_pc_wayland::cef::try_run_subprocess()? {
+        std::process::exit(code);
+    }
+
     let config = config::AppConfig::discover()?;
     app::run(config)
 }

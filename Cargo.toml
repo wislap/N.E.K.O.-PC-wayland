@@ -3,6 +3,10 @@ name = "neko_pc_wayland"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+cef_osr = []
+
 [dependencies]
 anyhow = "1.0.100"
 cairo-rs = "0.18.5"
@@ -19,6 +23,10 @@ tao = "0.30.8"
 wayland-client = "0.31.13"
 wry = { version = "0.53.5", features = ["transparent"] }
 xkeysym = "0.2.1"
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.2.18"
 
 [[bin]]
 name = "neko-pc-wayland"

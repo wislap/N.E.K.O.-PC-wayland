@@ -299,15 +299,10 @@ fn apply_wayland_input_region(
 enum wl_proxy {}
 #[cfg(target_os = "linux")]
 #[allow(non_camel_case_types)]
-enum wl_compositor {}
-#[cfg(target_os = "linux")]
-#[allow(non_camel_case_types)]
-enum wl_surface {}
-#[cfg(target_os = "linux")]
-#[allow(non_camel_case_types)]
 enum wl_region {}
 #[cfg(target_os = "linux")]
 #[allow(non_camel_case_types)]
+#[repr(C)]
 struct wl_interface {
     _private: [u8; 0],
 }

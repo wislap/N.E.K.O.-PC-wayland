@@ -10,6 +10,9 @@ pub enum WaylandHostMode {
     Legacy,
     Companion,
     RawOnly,
+    OfficialHelperProbe,
+    OfficialHelperRun,
+    CStandaloneProbe,
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,13 @@ pub struct AppConfig {
     pub debug_input_region: Option<InputRegion>,
     pub trace_input_region: bool,
     pub wayland_host_mode: WaylandHostMode,
+    pub window_width: u32,
+    pub window_height: u32,
+    pub render_width: u32,
+    pub render_height: u32,
+    pub render_fps: u32,
+    pub fullscreen: bool,
+    pub transparent_background: bool,
 }
 
 impl AppConfig {
@@ -42,7 +52,54 @@ impl AppConfig {
             debug_input_region: parse_debug_input_region()?,
             trace_input_region: env_flag("NEKO_WAYLAND_TRACE_INPUT_REGION"),
             wayland_host_mode: parse_wayland_host_mode()?,
+            window_width: parse_dimension("NEKO_WAYLAND_WINDOW_WIDTH", 1920)?,
+            window_height: parse_dimension("NEKO_WAYLAND_WINDOW_HEIGHT", 1080)?,
+            render_width: parse_dimension("NEKO_WAYLAND_RENDER_WIDTH", default_render_width())?,
+            render_height: parse_dimension(
+                "NEKO_WAYLAND_RENDER_HEIGHT",
+                default_render_height(),
+            )?,
+            render_fps: parse_dimension("NEKO_WAYLAND_RENDER_FPS", default_render_fps())?,
+            fullscreen: parse_fullscreen_flag(),
+            transparent_background: env_flag("NEKO_WAYLAND_TRANSPARENT_BACKGROUND"),
         })
+    }
+}
+
+fn default_render_width() -> u32 {
+    if parse_fullscreen_flag() { 1280 } else { 800 }
+}
+
+fn default_render_height() -> u32 {
+    if parse_fullscreen_flag() { 720 } else { 600 }
+}
+
+fn default_render_fps() -> u32 {
+    if parse_fullscreen_flag() { 12 } else { 30 }
+}
+
+fn parse_dimension(name: &str, default: u32) -> Result<u32> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = raw
+        .to_string_lossy()
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid {name} value {:?}", raw))?;
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn parse_fullscreen_flag() -> bool {
+    match env::var("NEKO_WAYLAND_FULLSCREEN") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
     }
 }
 
@@ -155,8 +212,16 @@ fn parse_wayland_host_mode() -> Result<WaylandHostMode> {
         "" | "legacy" | "default" | "tao" | "wry" => Ok(WaylandHostMode::Legacy),
         "companion" | "mirror" => Ok(WaylandHostMode::Companion),
         "raw_only" | "raw-only" | "raw" => Ok(WaylandHostMode::RawOnly),
+        "official_helper_probe" | "official-helper-probe" | "helper_probe" => {
+            Ok(WaylandHostMode::OfficialHelperProbe)
+        }
+        "official_helper_run" | "official-helper-run" | "helper_run" | "official_helper"
+        | "official-helper" => Ok(WaylandHostMode::OfficialHelperRun),
+        "c_standalone_probe" | "c-standalone-probe" | "c_helper_probe" | "c-helper-probe" => {
+            Ok(WaylandHostMode::CStandaloneProbe)
+        }
         other => bail!(
-            "invalid NEKO_WAYLAND_HOST_MODE value {:?}, expected legacy|companion|raw_only",
+            "invalid NEKO_WAYLAND_HOST_MODE value {:?}, expected legacy|companion|raw_only|official_helper_probe|official_helper_run|c_standalone_probe",
             other
         ),
     }

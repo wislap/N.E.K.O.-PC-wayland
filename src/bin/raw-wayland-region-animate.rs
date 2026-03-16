@@ -70,7 +70,9 @@ fn run() -> anyhow::Result<()> {
         }
     });
 
-    let join_result = host.join().map_err(|_| anyhow::anyhow!("raw host thread panicked"))?;
+    let join_result = host
+        .join()
+        .map_err(|_| anyhow::anyhow!("raw host thread panicked"))?;
     let _ = animator.join();
     join_result
 }

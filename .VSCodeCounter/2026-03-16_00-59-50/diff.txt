@@ -1,0 +1,39 @@
+Date : 2026-03-16 00:59:50
+Directory : /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src
+Total : 11 files,  1967 codes, 1 comments, 165 blanks, all 2133 lines
+
+Languages
++----------+------------+------------+------------+------------+------------+
+| language | files      | code       | comment    | blank      | total      |
++----------+------------+------------+------------+------------+------------+
+| Rust     |          9 |      1,261 |          0 |        108 |      1,369 |
+| C        |          2 |        706 |          1 |         57 |        764 |
++----------+------------+------------+------------+------------+------------+
+
+Directories
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                        | files      | code       | comment    | blank      | total      |
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                           |         11 |      1,967 |          1 |        165 |      2,133 |
+| . (Files)                                                                   |          5 |        883 |          0 |         64 |        947 |
+| bin                                                                         |          2 |        223 |          0 |         23 |        246 |
+| cef                                                                         |          4 |        861 |          1 |         78 |        940 |
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++-----------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| filename                                                                    | language | code       | comment    | blank      | total      |
++-----------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/app.rs                         | Rust     |        286 |          0 |         13 |        299 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/bin/cef-c-bridge-helper.rs     | Rust     |        215 |          0 |         23 |        238 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/bin/cef-custom-helper.rs       | Rust     |          8 |          0 |          0 |          8 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/c_bridge.rs                | Rust     |        152 |          0 |         21 |        173 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/c_standalone_helper_main.c | C        |        685 |          1 |         57 |        743 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/capi_probe.c               | C        |         21 |          0 |          0 |         21 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/mod.rs                     | Rust     |          3 |          0 |          0 |          3 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/config.rs                      | Rust     |          4 |          0 |          0 |          4 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/frame_bridge.rs                | Rust     |         40 |          0 |          8 |         48 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/lib.rs                         | Rust     |          2 |          0 |          0 |          2 |
+| /mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/standalone_helper.rs           | Rust     |        551 |          0 |         43 |        594 |
+| Total                                                                       |          |      1,967 |          1 |        165 |      2,133 |
++-----------------------------------------------------------------------------+----------+------------+------------+------------+------------+

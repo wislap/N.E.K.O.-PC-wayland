@@ -1,1 +1,15 @@
 /target
+/.cache/
+/cef_binary_*
+/*.tar.bz2
+/Release/
+/Resources/
+/locales/
+/swiftshader/
+/libcef.so
+/libEGL.so
+/libGLESv2.so
+/chrome-sandbox
+/icudtl.dat
+/snapshot_blob.bin
+/v8_context_snapshot.bin
