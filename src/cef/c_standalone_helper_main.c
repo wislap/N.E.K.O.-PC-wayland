@@ -12,6 +12,8 @@
 
 #include "include/capi/cef_app_capi.h"
 
+#define NEKO_COMMAND_BUFFER_CAPACITY 131072
+
 typedef struct _neko_cef_runtime_t neko_cef_runtime_t;
 typedef struct _neko_cef_browser_t neko_cef_browser_t;
 
@@ -242,6 +244,74 @@ static void trim_newlines(char* line) {
   }
 }
 
+static int base64_value(char ch) {
+  if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+  if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+  if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+  if (ch == '+') return 62;
+  if (ch == '/') return 63;
+  if (ch == '=') return -2;
+  return -1;
+}
+
+static char* base64_decode_alloc(const char* input, size_t* out_len) {
+  size_t len;
+  size_t alloc_len;
+  char* output;
+  size_t out = 0;
+  int vals[4];
+  size_t i;
+
+  if (out_len) {
+    *out_len = 0;
+  }
+  if (!input) {
+    return NULL;
+  }
+
+  len = strlen(input);
+  alloc_len = (len / 4 + 1) * 3 + 1;
+  output = (char*)malloc(alloc_len);
+  if (!output) {
+    return NULL;
+  }
+
+  for (i = 0; i < len;) {
+    int count = 0;
+    while (i < len && count < 4) {
+      int value = base64_value(input[i++]);
+      if (value == -1) {
+        continue;
+      }
+      vals[count++] = value;
+    }
+    if (count == 0) {
+      break;
+    }
+    if (count < 4) {
+      free(output);
+      return NULL;
+    }
+
+    output[out++] = (char)((vals[0] << 2) | ((vals[1] & 0x30) >> 4));
+    if (vals[2] != -2) {
+      output[out++] = (char)(((vals[1] & 0x0F) << 4) | ((vals[2] & 0x3C) >> 2));
+    }
+    if (vals[3] != -2 && vals[2] != -2) {
+      output[out++] = (char)(((vals[2] & 0x03) << 6) | vals[3]);
+    }
+    if (vals[2] == -2 || vals[3] == -2) {
+      break;
+    }
+  }
+
+  output[out] = '\0';
+  if (out_len) {
+    *out_len = out;
+  }
+  return output;
+}
+
 static int process_command_line(neko_cef_browser_t* browser, const char* line) {
   int focused;
   int x;
@@ -266,6 +336,20 @@ static int process_command_line(neko_cef_browser_t* browser, const char* line) {
 
   if (strcmp(line, "shutdown") == 0) {
     return 1;
+  }
+
+  if (strncmp(line, "eval_b64 script_b64=", 20) == 0) {
+    size_t script_len = 0;
+    char* script = base64_decode_alloc(line + 20, &script_len);
+    if (!script || script_len == 0) {
+      fprintf(stderr, "NEKO_CEF_STANDALONE failed to decode eval_b64 payload\n");
+      fflush(stderr);
+      free(script);
+      return 0;
+    }
+    neko_cef_bridge_browser_execute_javascript(browser, script, "neko://stdin-eval", 1);
+    free(script);
+    return 0;
   }
 
   if (sscanf(line, "focus focused=%d", &focused) == 1) {
@@ -327,7 +411,9 @@ static int process_stdin_commands(neko_cef_browser_t* browser, char* command_buf
     return 0;
   }
 
-  while ((bytes_read = read(STDIN_FILENO, command_buffer + *used, 4095 - *used)) > 0) {
+  while ((bytes_read = read(STDIN_FILENO,
+                            command_buffer + *used,
+                            (NEKO_COMMAND_BUFFER_CAPACITY - 1) - *used)) > 0) {
     *used += (size_t)bytes_read;
     command_buffer[*used] = '\0';
     while ((newline = strchr(command_buffer, '\n')) != NULL) {
@@ -342,7 +428,7 @@ static int process_stdin_commands(neko_cef_browser_t* browser, char* command_buf
       *used -= consumed;
       command_buffer[*used] = '\0';
     }
-    if (*used >= 4095) {
+    if (*used >= (NEKO_COMMAND_BUFFER_CAPACITY - 1)) {
       fprintf(stderr, "NEKO_CEF_STANDALONE stdin command buffer overflow, resetting\n");
       fflush(stderr);
       *used = 0;
@@ -411,10 +497,18 @@ static void on_load_end(void* user_data, int http_status_code) {
         "'#chatContainer','#text-input-area','#textInputBox','#button-group','#screenshots-list',"
         "'#screenshots-header','.chat-resize-handle','.modal-dialog','.modal-overlay',"
         "'.live2d-popup','.vrm-popup','[id^=\"live2d-popup-\"]','[id^=\"vrm-popup-\"]',"
-        "'[data-neko-sidepanel]','[data-neko-sidepanel-owner]','[data-neko-interactive]'];"
+        "'[data-neko-sidepanel]','[data-neko-sidepanel-owner]','[data-neko-interactive]',"
+        "'.driver-overlay','.driver-highlight','.driver-popover','.driver-popover-footer',"
+        "'.driver-next','.driver-prev','.driver-close-btn','.driver-popover-title',"
+        "'#neko-tutorial-skip-btn','#agent-task-hud','#agent-task-list','#live2d-agent-status',"
+        "'.task-card','.task-card-cancel','.neko-systray-menu','.neko-systray-menu__panel',"
+        "'.neko-systray-location','[id*=\"tutorial-target\"]','[class*=\"tutorial\"]',"
+        "'[class*=\"popover\"]','[class*=\"sidepanel\"]','[class*=\"sidebar\"]'];"
+        "const interactiveLeafSelector='button,input,textarea,select,summary,a[href],[role=\"button\"],[role=\"dialog\"],[role=\"menu\"],[role=\"menuitem\"],[role=\"tab\"],[role=\"switch\"],[role=\"checkbox\"],[role=\"radio\"],[role=\"slider\"],[role=\"textbox\"],[role=\"tooltip\"],[role=\"option\"],[role=\"listbox\"],[contenteditable=\"true\"],[tabindex],[aria-haspopup=\"true\"],[data-neko-interactive],[data-action],[onclick]';"
         "let last='';"
         "let lastDrag='';"
         "let lastNoDrag='';"
+        "let captureCanvas=null;"
         "let scheduled=false;"
         "let timer=0;"
         "function interactiveTag(el){"
@@ -422,8 +516,13 @@ static void on_load_end(void* user_data, int http_status_code) {
         "el.getAttribute('data-action')||'',(el.parentElement&&el.parentElement.id)||'',"
         "(el.parentElement&&el.parentElement.className)||''].join(' ').toLowerCase();"
         "return text.includes('live2d')||text.includes('vrm')||text.includes('l2d')||"
-        "text.includes('dialog')||text.includes('popup')||text.includes('bubble')||"
-        "text.includes('button')||text.includes('chat')||text.includes('input');"
+        "text.includes('dialog')||text.includes('popup')||text.includes('popover')||"
+        "text.includes('bubble')||text.includes('button')||text.includes('chat')||"
+        "text.includes('input')||text.includes('tutorial')||text.includes('guide')||"
+        "text.includes('driver')||text.includes('highlight')||text.includes('overlay')||"
+        "text.includes('skip')||text.includes('panel')||text.includes('sidebar')||"
+        "text.includes('drawer')||text.includes('menu')||text.includes('hud')||"
+        "text.includes('agent')||text.includes('task');"
         "}"
         "function visibleAndEnabled(el){"
         "let node=el;"
@@ -447,6 +546,78 @@ static void on_load_end(void* user_data, int http_status_code) {
         "const style=getComputedStyle(el);"
         "return (style.getPropertyValue('-webkit-app-region')||style.getPropertyValue('app-region')||style.webkitAppRegion||'').trim().toLowerCase();"
         "}"
+        "function numericZIndex(value){"
+        "const z=Number.parseInt(value||'0',10);"
+        "return Number.isFinite(z)?z:0;"
+        "}"
+        "function looksClickable(el){"
+        "if(!el)return false;"
+        "const style=getComputedStyle(el);"
+        "const cursor=(style.cursor||'').toLowerCase();"
+        "return cursor==='pointer'||cursor==='text'||cursor==='move'||cursor==='grab'||cursor==='grabbing'||typeof el.onclick==='function'||el.hasAttribute('onclick')||el.hasAttribute('data-action');"
+        "}"
+        "function hasInteractiveDescendant(el){"
+        "if(!el||typeof el.matches!=='function')return false;"
+        "if(el.matches(interactiveLeafSelector))return true;"
+        "return !!el.querySelector(interactiveLeafSelector);"
+        "}"
+        "function isInteractiveLeaf(el){"
+        "if(!el||typeof el.matches!=='function')return false;"
+        "if(el.matches(interactiveLeafSelector))return true;"
+        "return looksClickable(el)&&interactiveTag(el);"
+        "}"
+        "function hasVisualSurface(style){"
+        "const bg=(style.backgroundColor||'').toLowerCase();"
+        "const borderW=(style.borderTopWidth||'0')!=='0px'||(style.borderRightWidth||'0')!=='0px'||(style.borderBottomWidth||'0')!=='0px'||(style.borderLeftWidth||'0')!=='0px';"
+        "return (bg&&bg!=='transparent'&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='rgb(0, 0, 0, 0)')||style.boxShadow!=='none'||style.backdropFilter!=='none'||style.filter!=='none'||borderW;"
+        "}"
+        "function looksLikeInteractiveOverlay(el){"
+        "if(!el)return false;"
+        "const style=getComputedStyle(el);"
+        "const pos=(style.position||'').toLowerCase();"
+        "const z=numericZIndex(style.zIndex);"
+        "const r=el.getBoundingClientRect();"
+        "const huge=r.width>=window.innerWidth*0.82&&r.height>=window.innerHeight*0.55;"
+        "const almostFull=r.width>=window.innerWidth*0.94&&r.height>=window.innerHeight*0.94;"
+        "const tagged=interactiveTag(el)||hasInteractiveDescendant(el);"
+        "if((pos==='fixed'||pos==='absolute')&&z>=9999&&tagged)return true;"
+        "if(almostFull&&z>=9000&&tagged)return true;"
+        "if(huge&&tagged&&el.querySelector&&el.querySelector('button,.driver-popover,[data-neko-sidepanel],#neko-tutorial-skip-btn,#agent-task-hud,.task-card'))return true;"
+        "return false;"
+        "}"
+        "function shouldPromoteInteractiveAncestor(el){"
+        "if(!el||el===document.body||el===document.documentElement)return false;"
+        "if(!visibleAndEnabled(el)||!acceptsPointer(el))return false;"
+        "const r=el.getBoundingClientRect();"
+        "if(r.width<8||r.height<8)return false;"
+        "const style=getComputedStyle(el);"
+        "const pos=(style.position||'').toLowerCase();"
+        "const z=numericZIndex(style.zIndex);"
+        "const role=(el.getAttribute('role')||'').toLowerCase();"
+        "const tagged=interactiveTag(el);"
+        "const descendantInteractive=hasInteractiveDescendant(el);"
+        "const floating=pos==='fixed'||pos==='absolute'||pos==='sticky';"
+        "const surfaced=hasVisualSurface(style);"
+        "const huge=r.width>=window.innerWidth*0.94&&r.height>=window.innerHeight*0.94;"
+        "const semantic=role==='dialog'||role==='menu'||role==='menuitem'||role==='tooltip'||role==='listbox'||role==='group'||role==='region';"
+        "if(looksLikeInteractiveOverlay(el))return true;"
+        "if(huge)return false;"
+        "if(semantic&&descendantInteractive)return true;"
+        "if(floating&&surfaced&&descendantInteractive)return true;"
+        "if(z>=100&&surfaced&&(tagged||descendantInteractive))return true;"
+        "if(tagged&&descendantInteractive&&(floating||surfaced))return true;"
+        "return false;"
+        "}"
+        "function promoteInteractiveAncestors(rects,el,seen){"
+        "let depth=0;"
+        "for(let node=el.parentElement;node&&node!==document.body&&node!==document.documentElement;node=node.parentElement){"
+        "if(depth++>6)break;"
+        "if(!shouldPromoteInteractiveAncestor(node))continue;"
+        "if(!seen.has(node)){seen.add(node);addRect(rects,node.getBoundingClientRect());}"
+        "const r=node.getBoundingClientRect();"
+        "if(r.width>=window.innerWidth*0.9&&r.height>=window.innerHeight*0.9)break;"
+        "}"
+        "}"
         "function addRect(rects,r){"
         "const left=Math.max(0,Math.round(r.left));"
         "const top=Math.max(0,Math.round(r.top));"
@@ -463,7 +634,7 @@ static void on_load_end(void* user_data, int http_status_code) {
         "function rectContains(outer,inner){"
         "return inner.x>=outer.x&&inner.y>=outer.y&&inner.x+inner.width<=outer.x+outer.width&&inner.y+inner.height<=outer.y+outer.height;"
         "}"
-        "function normalizeRects(rects){"
+        "function normalizeRects(rects,maxRects){"
         "const normalized=[];"
         "for(const rect of rects){"
         "let skip=false;"
@@ -474,7 +645,7 @@ static void on_load_end(void* user_data, int http_status_code) {
         "if(rectContains(rect,other)){normalized.splice(i,1);}"
         "}"
         "if(!skip)normalized.push(rect);"
-        "if(normalized.length>=24)break;"
+        "if(maxRects&&normalized.length>=maxRects)break;"
         "}"
         "return normalized;"
         "}"
@@ -512,6 +683,15 @@ static void on_load_end(void* user_data, int http_status_code) {
         "addRect(rects,{left:part.cx-part.w/2,top:part.y,right:part.cx+part.w/2,bottom:part.y+part.h});"
         "}"
         "}"
+        "function getCaptureContext(width,height){"
+        "if(!captureCanvas){"
+        "captureCanvas=document.createElement('canvas');"
+        "captureCanvas.id='neko-wayland-live2d-mask-canvas';"
+        "}"
+        "if(captureCanvas.width!==width)captureCanvas.width=width;"
+        "if(captureCanvas.height!==height)captureCanvas.height=height;"
+        "return captureCanvas.getContext('2d',{willReadFrequently:true});"
+        "}"
         "function addLive2DModelRect(rects){"
         "try{"
         "const manager=window.live2dManager;"
@@ -519,12 +699,68 @@ static void on_load_end(void* user_data, int http_status_code) {
         "if(manager.isLocked)return;"
         "const model=typeof manager.getCurrentModel==='function'?manager.getCurrentModel():manager.currentModel;"
         "if(!model||typeof model.getBounds!=='function')return;"
+        "const canvas=document.getElementById('live2d-canvas');"
+        "if(!canvas||!canvas.width||!canvas.height)return;"
         "const bounds=model.getBounds();"
         "if(!bounds)return;"
-        "const width=Number(bounds.right)-Number(bounds.left);"
-        "const height=Number(bounds.bottom)-Number(bounds.top);"
+        "const left=Number(bounds.left);"
+        "const top=Number(bounds.top);"
+        "const right=Number(bounds.right);"
+        "const bottom=Number(bounds.bottom);"
+        "const width=right-left;"
+        "const height=bottom-top;"
         "if(!Number.isFinite(width)||!Number.isFinite(height)||width<8||height<8)return;"
-        "addApproxRects(rects,Number(bounds.left),Number(bounds.top),Number(bounds.right),Number(bounds.bottom));"
+        "const clipLeft=Math.max(0,Math.floor(left));"
+        "const clipTop=Math.max(0,Math.floor(top));"
+        "const clipRight=Math.min(window.innerWidth,Math.ceil(right));"
+        "const clipBottom=Math.min(window.innerHeight,Math.ceil(bottom));"
+        "const clipWidth=clipRight-clipLeft;"
+        "const clipHeight=clipBottom-clipTop;"
+        "if(clipWidth<2||clipHeight<2)return;"
+        "const canvasRect=canvas.getBoundingClientRect();"
+        "if(!canvasRect||canvasRect.width<1||canvasRect.height<1)return;"
+        "const scaleX=canvas.width/canvasRect.width;"
+        "const scaleY=canvas.height/canvasRect.height;"
+        "const srcX=Math.max(0,Math.floor((clipLeft-canvasRect.left)*scaleX));"
+        "const srcY=Math.max(0,Math.floor((clipTop-canvasRect.top)*scaleY));"
+        "const srcRight=Math.min(canvas.width,Math.ceil((clipRight-canvasRect.left)*scaleX));"
+        "const srcBottom=Math.min(canvas.height,Math.ceil((clipBottom-canvasRect.top)*scaleY));"
+        "const srcWidth=srcRight-srcX;"
+        "const srcHeight=srcBottom-srcY;"
+        "if(srcWidth<1||srcHeight<1)return;"
+        "const ctx=getCaptureContext(clipWidth,clipHeight);"
+        "if(!ctx)return;"
+        "ctx.clearRect(0,0,clipWidth,clipHeight);"
+        "ctx.drawImage(canvas,srcX,srcY,srcWidth,srcHeight,0,0,clipWidth,clipHeight);"
+        "const image=ctx.getImageData(0,0,clipWidth,clipHeight);"
+        "const data=image&&image.data;"
+        "if(!data||!data.length)return;"
+        "let active=new Map();"
+        "for(let y=0;y<clipHeight;y++){"
+        "const row=new Map();"
+        "let x=0;"
+        "while(x<clipWidth){"
+        "let alpha=data[(y*clipWidth+x)*4+3];"
+        "while(x<clipWidth&&alpha<16){x++;alpha=data[(y*clipWidth+x)*4+3];}"
+        "if(x>=clipWidth)break;"
+        "const start=x;"
+        "alpha=data[(y*clipWidth+x)*4+3];"
+        "while(x<clipWidth&&alpha>=16){x++;alpha=data[(y*clipWidth+x)*4+3];}"
+        "const runWidth=x-start;"
+        "if(runWidth<1)continue;"
+        "const key=start+':'+runWidth;"
+        "const existing=active.get(key);"
+        "if(existing&&existing.y+existing.height===clipTop+y){"
+        "existing.height+=1;"
+        "row.set(key,existing);"
+        "}else{"
+        "const rect={x:clipLeft+start,y:clipTop+y,width:runWidth,height:1};"
+        "rects.push(rect);"
+        "row.set(key,rect);"
+        "}"
+        "}"
+        "active=row;"
+        "}"
         "}catch(_){}}"
         "function addVrmModelRect(rects){"
         "try{"
@@ -559,12 +795,13 @@ static void on_load_end(void* user_data, int http_status_code) {
         "}catch(_){}}"
         "function collect(){"
         "scheduled=false;"
-        "const rects=[];"
+        "const uiRects=[];"
+        "const avatarRects=[];"
         "const dragRects=[];"
         "const noDragRects=[];"
         "const seen=new Set();"
-        "addLive2DModelRect(rects);"
-        "addVrmModelRect(rects);"
+        "addLive2DModelRect(avatarRects);"
+        "addVrmModelRect(avatarRects);"
         "for(const el of document.querySelectorAll('body *')){"
         "if(!el||!visibleAndEnabled(el)||!acceptsPointer(el))continue;"
         "const region=appRegion(el);"
@@ -580,15 +817,32 @@ static void on_load_end(void* user_data, int http_status_code) {
         "if(!visibleAndEnabled(el))continue;"
         "if(!acceptsPointer(el)&&!interactiveTag(el))continue;"
         "const r=el.getBoundingClientRect();"
-        "if(r.width>=window.innerWidth*0.98&&r.height>=window.innerHeight*0.98&&!interactiveTag(el))continue;"
-        "addRect(rects,r);"
+        "if(r.width>=window.innerWidth*0.98&&r.height>=window.innerHeight*0.98&&!interactiveTag(el)&&!looksLikeInteractiveOverlay(el))continue;"
+        "addRect(uiRects,r);"
         "}"
         "}"
-        "const payload=JSON.stringify(normalizeRects(rects));"
+        "for(const el of document.querySelectorAll(interactiveLeafSelector)){"
+        "if(!el||seen.has(el)||!visibleAndEnabled(el)||!acceptsPointer(el))continue;"
+        "const r=el.getBoundingClientRect();"
+        "if(r.width<2||r.height<2)continue;"
+        "if(!isInteractiveLeaf(el))continue;"
+        "seen.add(el);"
+        "addRect(uiRects,r);"
+        "promoteInteractiveAncestors(uiRects,el,seen);"
+        "}"
+        "for(const el of document.querySelectorAll('body *')){"
+        "if(!el||seen.has(el)||!visibleAndEnabled(el))continue;"
+        "if(!acceptsPointer(el)&&!interactiveTag(el))continue;"
+        "const overlay=looksLikeInteractiveOverlay(el);"
+        "if(!overlay)continue;"
+        "seen.add(el);"
+        "addRect(uiRects,el.getBoundingClientRect());"
+        "}"
+        "const payload=JSON.stringify(normalizeRects(normalizeRects(uiRects,384).concat(normalizeRects(avatarRects,768)),1152));"
         "if(payload!==last){last=payload;console.log('NEKO_INPUT_REGION:'+payload);}"
-        "const dragPayload=JSON.stringify(normalizeRects(dragRects));"
+        "const dragPayload=JSON.stringify(normalizeRects(dragRects,128));"
         "if(dragPayload!==lastDrag){lastDrag=dragPayload;console.log('NEKO_DRAG_REGION:'+dragPayload);}"
-        "const noDragPayload=JSON.stringify(normalizeRects(noDragRects));"
+        "const noDragPayload=JSON.stringify(normalizeRects(noDragRects,128));"
         "if(noDragPayload!==lastNoDrag){lastNoDrag=noDragPayload;console.log('NEKO_DRAG_EXCLUSION_REGION:'+noDragPayload);}"
         "}"
         "function schedule(){"
@@ -606,6 +860,7 @@ static void on_load_end(void* user_data, int http_status_code) {
         "window.addEventListener('live2d-agent-popup-closed',schedule,{passive:true});"
         "new MutationObserver(schedule).observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['style','class','hidden']});"
         "setInterval(schedule,1500);"
+        "setInterval(function(){try{if(window.live2dManager&&window.live2dManager.currentModel&&!window.live2dManager.isLocked)schedule();}catch(_){}} ,250);"
         "setTimeout(schedule,0);"
         "setTimeout(schedule,300);"
         "setTimeout(schedule,1000);"
@@ -634,22 +889,48 @@ static void on_console(void* user_data,
                        int line,
                        const char* message) {
   (void)user_data;
+  if (message && strncmp(message, "NEKO_FRONTEND_IPC_B64:", 22) == 0) {
+    size_t payload_len = strlen(message + 22);
+    char* details = (char*)malloc(payload_len + 13);
+    if (!details) {
+      return;
+    }
+    snprintf(details, payload_len + 13, "payload_b64=%s", message + 22);
+    emit_event("frontend_ipc", details);
+    free(details);
+    return;
+  }
   if (message && strncmp(message, "NEKO_INPUT_REGION:", 18) == 0) {
-    char details[3072];
-    snprintf(details, sizeof(details), "rects=%s", message + 18);
+    size_t rects_len = strlen(message + 18);
+    char* details = (char*)malloc(rects_len + 7);
+    if (!details) {
+      return;
+    }
+    snprintf(details, rects_len + 7, "rects=%s", message + 18);
     emit_event("input_region", details);
+    free(details);
     return;
   }
   if (message && strncmp(message, "NEKO_DRAG_REGION:", 17) == 0) {
-    char details[3072];
-    snprintf(details, sizeof(details), "rects=%s", message + 17);
+    size_t rects_len = strlen(message + 17);
+    char* details = (char*)malloc(rects_len + 7);
+    if (!details) {
+      return;
+    }
+    snprintf(details, rects_len + 7, "rects=%s", message + 17);
     emit_event("drag_region", details);
+    free(details);
     return;
   }
   if (message && strncmp(message, "NEKO_DRAG_EXCLUSION_REGION:", 27) == 0) {
-    char details[3072];
-    snprintf(details, sizeof(details), "rects=%s", message + 27);
+    size_t rects_len = strlen(message + 27);
+    char* details = (char*)malloc(rects_len + 7);
+    if (!details) {
+      return;
+    }
+    snprintf(details, rects_len + 7, "rects=%s", message + 27);
     emit_event("drag_exclusion_region", details);
+    free(details);
     return;
   }
   if (!env_flag_enabled("NEKO_CEF_VERBOSE_CONSOLE")) {
@@ -837,7 +1118,7 @@ int main(int argc, char** argv) {
   neko_cef_browser_config_t browser_config;
   neko_cef_browser_callbacks_t callbacks;
   neko_cef_standalone_state_t state;
-  char command_buffer[4096];
+  char command_buffer[NEKO_COMMAND_BUFFER_CAPACITY];
   size_t command_buffer_used;
   int code;
   int should_shutdown = 0;

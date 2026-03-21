@@ -57,6 +57,7 @@ pub struct RawHostConfig {
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
+    pub target_output_id: Option<String>,
     pub target_output_index: Option<usize>,
     pub target_output_name: Option<String>,
     pub input_region_source_size: Option<(u32, u32)>,
@@ -197,6 +198,7 @@ impl RawHostConfig {
             width: 800,
             height: 600,
             fullscreen: false,
+            target_output_id: None,
             target_output_index: None,
             target_output_name: None,
             input_region_source_size: None,
@@ -226,12 +228,24 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
     let (sender, receiver) = channel::<RawHostCommand>();
     let running = Arc::new(AtomicBool::new(true));
     let surface_size = Arc::new(Mutex::new((config.width, config.height)));
+    let shared_state = Arc::new(Mutex::new(RawHostSharedState {
+        window_state: RawHostWindowStateSnapshot {
+            width: config.width,
+            height: config.height,
+            scale_factor: 1.0,
+            fullscreen: config.fullscreen,
+            visible: true,
+            ..RawHostWindowStateSnapshot::default()
+        },
+        ..RawHostSharedState::default()
+    }));
     let latest_frame = Arc::new(Mutex::new(None));
     let frame_update_pending = Arc::new(AtomicBool::new(false));
     let pointer_subscribers = Arc::new(Mutex::new(Vec::new()));
     let keyboard_subscribers = Arc::new(Mutex::new(Vec::new()));
     let thread_running = Arc::clone(&running);
     let thread_surface_size = Arc::clone(&surface_size);
+    let thread_shared_state = Arc::clone(&shared_state);
     let thread_latest_frame = Arc::clone(&latest_frame);
     let thread_frame_update_pending = Arc::clone(&frame_update_pending);
     let thread_pointer_subscribers = Arc::clone(&pointer_subscribers);
@@ -244,6 +258,7 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
                 Some(receiver),
                 thread_running,
                 thread_surface_size,
+                thread_shared_state,
                 thread_latest_frame,
                 thread_frame_update_pending,
                 thread_pointer_subscribers,
@@ -257,6 +272,7 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
             sender,
             running,
             surface_size,
+            shared_state,
             latest_frame,
             frame_update_pending,
             pointer_subscribers,
@@ -272,6 +288,17 @@ fn run_inner(
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let surface_size = Arc::new(Mutex::new((config.width, config.height)));
+    let shared_state = Arc::new(Mutex::new(RawHostSharedState {
+        window_state: RawHostWindowStateSnapshot {
+            width: config.width,
+            height: config.height,
+            scale_factor: 1.0,
+            fullscreen: config.fullscreen,
+            visible: true,
+            ..RawHostWindowStateSnapshot::default()
+        },
+        ..RawHostSharedState::default()
+    }));
     let latest_frame = Arc::new(Mutex::new(None));
     let frame_update_pending = Arc::new(AtomicBool::new(false));
     run_inner_with_running(
@@ -279,6 +306,7 @@ fn run_inner(
         commands,
         running,
         surface_size,
+        shared_state,
         latest_frame,
         frame_update_pending,
         Arc::new(Mutex::new(Vec::new())),
@@ -291,6 +319,7 @@ fn run_inner_with_running(
     commands: Option<smithay_client_toolkit::reexports::calloop::channel::Channel<RawHostCommand>>,
     running: Arc<AtomicBool>,
     surface_size: Arc<Mutex<(u32, u32)>>,
+    shared_state: Arc<Mutex<RawHostSharedState>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
@@ -357,6 +386,7 @@ fn run_inner_with_running(
             width: config.width,
             height: config.height,
             fullscreen: config.fullscreen,
+            target_output_id: config.target_output_id.clone(),
             target_output_index: config.target_output_index,
             target_output_name: config.target_output_name.clone(),
             input_region_source_size: config.input_region_source_size,
@@ -385,6 +415,7 @@ fn run_inner_with_running(
             frame: None,
             shared_frame_reader: None,
             shared_frame: None,
+            current_output_id: None,
             fullscreen_output_applied: false,
             input_region_applied: false,
             transparent_outside_input_region: config.transparent_outside_input_region,
@@ -402,6 +433,7 @@ fn run_inner_with_running(
         window_move_active: false,
         running,
         surface_size,
+        shared_state,
         latest_frame,
         frame_update_pending,
         pointer_subscribers,
@@ -410,6 +442,7 @@ fn run_inner_with_running(
     };
 
     app.apply_fullscreen_output_preference();
+    app.sync_shared_state();
 
     if let Some(command_channel) = commands {
         event_loop
@@ -473,10 +506,55 @@ pub struct RawHostHandle {
     sender: ChannelSender<RawHostCommand>,
     running: Arc<AtomicBool>,
     surface_size: Arc<Mutex<(u32, u32)>>,
+    shared_state: Arc<Mutex<RawHostSharedState>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
     keyboard_subscribers: Arc<Mutex<Vec<Sender<RawHostKeyboardEvent>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawHostDisplaySnapshot {
+    pub id: String,
+    pub name: Option<String>,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawHostWindowStateSnapshot {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f64,
+    pub fullscreen: bool,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RawHostSharedState {
+    displays: Vec<RawHostDisplaySnapshot>,
+    current_output_id: Option<String>,
+    window_state: RawHostWindowStateSnapshot,
+}
+
+impl Default for RawHostWindowStateSnapshot {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            scale_factor: 1.0,
+            fullscreen: false,
+            visible: true,
+        }
+    }
 }
 
 impl RawHostHandle {
@@ -575,6 +653,36 @@ impl RawHostHandle {
             .push(sender);
         receiver
     }
+
+    pub fn set_target_output_id(&self, display_id: Option<String>) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::SetTargetOutputId(display_id))
+            .map_err(|err| anyhow!("failed to update raw host target output: {err}"))
+    }
+
+    pub fn displays(&self) -> Vec<RawHostDisplaySnapshot> {
+        self.shared_state
+            .lock()
+            .expect("raw host shared state mutex poisoned")
+            .displays
+            .clone()
+    }
+
+    pub fn current_output_id(&self) -> Option<String> {
+        self.shared_state
+            .lock()
+            .expect("raw host shared state mutex poisoned")
+            .current_output_id
+            .clone()
+    }
+
+    pub fn window_state(&self) -> RawHostWindowStateSnapshot {
+        self.shared_state
+            .lock()
+            .expect("raw host shared state mutex poisoned")
+            .window_state
+            .clone()
+    }
 }
 
 #[derive(Debug)]
@@ -583,6 +691,7 @@ enum RawHostCommand {
     SetDragRegion(InputRegion),
     SetDragExclusionRegion(InputRegion),
     SetVisibleRegion(Option<InputRegion>),
+    SetTargetOutputId(Option<String>),
     AttachSharedFrameReader(SharedFrameReader),
     RefreshSharedFrame {
         width: u32,
@@ -598,6 +707,7 @@ struct RawHostRuntime {
     width: u32,
     height: u32,
     fullscreen: bool,
+    target_output_id: Option<String>,
     target_output_index: Option<usize>,
     target_output_name: Option<String>,
     input_region_source_size: Option<(u32, u32)>,
@@ -611,6 +721,7 @@ struct RawHostRuntime {
     frame: Option<RawHostFrame>,
     shared_frame_reader: Option<SharedFrameReader>,
     shared_frame: Option<RawHostFrame>,
+    current_output_id: Option<String>,
     fullscreen_output_applied: bool,
     input_region_applied: bool,
     transparent_outside_input_region: bool,
@@ -640,6 +751,7 @@ struct RawHostApp {
     window_move_active: bool,
     running: Arc<AtomicBool>,
     surface_size: Arc<Mutex<(u32, u32)>>,
+    shared_state: Arc<Mutex<RawHostSharedState>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
@@ -648,6 +760,71 @@ struct RawHostApp {
 }
 
 impl RawHostApp {
+    fn output_snapshot(
+        info: &OutputInfo,
+        current_output_id: Option<&str>,
+    ) -> RawHostDisplaySnapshot {
+        let id = Self::output_id(info);
+        let (x, y) = info.logical_position.unwrap_or(info.location);
+        let (width, height) = info.logical_size.unwrap_or_else(|| {
+            info.modes
+                .iter()
+                .find(|mode| mode.current)
+                .map(|mode| mode.dimensions)
+                .unwrap_or((0, 0))
+        });
+        RawHostDisplaySnapshot {
+            id: id.clone(),
+            name: info.name.clone().or_else(|| info.description.clone()),
+            x,
+            y,
+            width: width.max(0) as u32,
+            height: height.max(0) as u32,
+            scale_factor: info.scale_factor as f64,
+            is_current: current_output_id == Some(id.as_str()),
+        }
+    }
+
+    fn sync_shared_state(&self) {
+        let mut displays = self
+            .output_state
+            .outputs()
+            .filter_map(|output| {
+                self.output_state
+                    .info(&output)
+                    .map(|info| Self::output_snapshot(&info, self.runtime.current_output_id.as_deref()))
+            })
+            .collect::<Vec<_>>();
+        displays.sort_by_key(|display| (display.x, display.y, display.name.clone()));
+
+        let current = self.runtime.current_output_id.as_ref().and_then(|id| {
+            displays
+                .iter()
+                .find(|display| display.id == *id)
+                .cloned()
+        });
+        let window_state = RawHostWindowStateSnapshot {
+            x: current.as_ref().map(|display| display.x).unwrap_or_default(),
+            y: current.as_ref().map(|display| display.y).unwrap_or_default(),
+            width: self.runtime.width,
+            height: self.runtime.height,
+            scale_factor: current
+                .as_ref()
+                .map(|display| display.scale_factor)
+                .unwrap_or(1.0),
+            fullscreen: self.runtime.fullscreen,
+            visible: !self.exit && self.running.load(Ordering::SeqCst),
+        };
+
+        let mut shared_state = self
+            .shared_state
+            .lock()
+            .expect("raw host shared state mutex poisoned");
+        shared_state.displays = displays;
+        shared_state.current_output_id = self.runtime.current_output_id.clone();
+        shared_state.window_state = window_state;
+    }
+
     fn output_matches_name(info: &OutputInfo, expected: &str) -> bool {
         let expected = expected.trim().to_ascii_lowercase();
         if expected.is_empty() {
@@ -685,17 +862,63 @@ impl RawHostApp {
         }
     }
 
+    fn output_id(info: &OutputInfo) -> String {
+        let name = info
+            .name
+            .as_deref()
+            .or(info.description.as_deref())
+            .unwrap_or("<unnamed>");
+        let sanitized_name = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else if matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let (x, y) = info.logical_position.unwrap_or(info.location);
+        let (width, height) = info.logical_size.unwrap_or_else(|| {
+            info.modes
+                .iter()
+                .find(|mode| mode.current)
+                .map(|mode| mode.dimensions)
+                .unwrap_or((0, 0))
+        });
+        format!(
+            "display:{}:{}:{}:{}:{}:{}",
+            sanitized_name.trim_matches('_'),
+            x,
+            y,
+            width,
+            height,
+            info.scale_factor
+        )
+    }
+
     fn apply_fullscreen_output_preference(&mut self) {
         if !self.runtime.fullscreen || self.runtime.fullscreen_output_applied {
+            self.sync_shared_state();
             return;
         }
 
         let outputs = self.output_state.outputs().collect::<Vec<_>>();
         if outputs.is_empty() {
+            self.sync_shared_state();
             return;
         }
 
-        let selected = if let Some(index) = self.runtime.target_output_index {
+        let selected = if let Some(expected_id) = self.runtime.target_output_id.as_deref() {
+            outputs.iter().find_map(|output| {
+                let info = self.output_state.info(output);
+                info.as_ref()
+                    .filter(|info| Self::output_id(info) == expected_id)
+                    .map(|info| (output.clone(), Some(info.clone())))
+            })
+        } else if let Some(index) = self.runtime.target_output_index {
             outputs
                 .get(index)
                 .cloned()
@@ -715,6 +938,7 @@ impl RawHostApp {
             self.window.set_fullscreen(Some(&output));
             self.window.commit();
             self.runtime.fullscreen_output_applied = true;
+            self.sync_shared_state();
             eprintln!(
                 "raw host fullscreen target applied: {}",
                 Self::describe_output(info.as_ref())
@@ -722,7 +946,7 @@ impl RawHostApp {
             return;
         }
 
-        if self.runtime.target_output_name.is_some()
+        if (self.runtime.target_output_id.is_some() || self.runtime.target_output_name.is_some())
             && outputs.iter().any(|output| self.output_state.info(output).is_none())
         {
             return;
@@ -731,7 +955,13 @@ impl RawHostApp {
         self.window.set_fullscreen(None);
         self.window.commit();
         self.runtime.fullscreen_output_applied = true;
-        if let Some(index) = self.runtime.target_output_index {
+        self.sync_shared_state();
+        if let Some(id) = self.runtime.target_output_id.as_deref() {
+            eprintln!(
+                "raw host target output id {:?} not found; using compositor default fullscreen output",
+                id
+            );
+        } else if let Some(index) = self.runtime.target_output_index {
             eprintln!(
                 "raw host target output index {} not found; using compositor default fullscreen output",
                 index
@@ -797,6 +1027,17 @@ impl RawHostApp {
                 self.runtime.visible_region = region;
                 self.draw()?;
             }
+            RawHostCommand::SetTargetOutputId(display_id) => {
+                self.runtime.target_output_id = display_id;
+                self.runtime.target_output_index = None;
+                self.runtime.target_output_name = None;
+                self.runtime.fullscreen_output_applied = false;
+                if self.runtime.fullscreen {
+                    self.window.set_fullscreen(None);
+                    self.window.commit();
+                }
+                self.apply_fullscreen_output_preference();
+            }
             RawHostCommand::AttachSharedFrameReader(reader) => {
                 self.runtime.shared_frame_reader = Some(reader);
             }
@@ -818,6 +1059,7 @@ impl RawHostApp {
             RawHostCommand::Shutdown => {
                 self.exit = true;
                 self.running.store(false, Ordering::SeqCst);
+                self.sync_shared_state();
             }
         }
         Ok(())
@@ -1269,8 +1511,18 @@ impl CompositorHandler for RawHostApp {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        let info = self.output_state.info(output);
+        self.runtime.current_output_id = info.as_ref().map(Self::output_id);
+        if self.runtime.log_pointer_events {
+            eprintln!(
+                "raw host surface entered output: id={:?} desc={}",
+                self.runtime.current_output_id,
+                Self::describe_output(info.as_ref())
+            );
+        }
+        self.sync_shared_state();
     }
 
     fn surface_leave(
@@ -1278,8 +1530,16 @@ impl CompositorHandler for RawHostApp {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        let leaving_output_id = self.output_state.info(output).as_ref().map(Self::output_id);
+        if leaving_output_id.is_some() && self.runtime.current_output_id == leaving_output_id {
+            self.runtime.current_output_id = None;
+        }
+        if self.runtime.log_pointer_events {
+            eprintln!("raw host surface left output: id={leaving_output_id:?}");
+        }
+        self.sync_shared_state();
     }
 }
 
@@ -1312,6 +1572,7 @@ impl OutputHandler for RawHostApp {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        self.sync_shared_state();
     }
 }
 
@@ -1319,6 +1580,7 @@ impl WindowHandler for RawHostApp {
     fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
         self.exit = true;
         self.running.store(false, Ordering::SeqCst);
+        self.sync_shared_state();
     }
 
     fn configure(
@@ -1392,6 +1654,7 @@ impl WindowHandler for RawHostApp {
         }
 
         self.apply_fullscreen_output_preference();
+        self.sync_shared_state();
 
         if (!size_changed && !was_first_configure) || self.exit {
             return;

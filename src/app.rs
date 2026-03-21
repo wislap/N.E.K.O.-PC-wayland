@@ -53,7 +53,9 @@ use crate::wayland::engine::{
     StrategySelection, apply_input_region_to_window, choose_strategy, maybe_dump_widget_tree,
 };
 use crate::wayland::input_region::InputRegion;
-use crate::wayland::raw_host::{RawHostConfig, RawHostHandle, spawn as spawn_raw_host};
+use crate::wayland::raw_host::{
+    RawHostConfig, RawHostDisplaySnapshot, RawHostHandle, spawn as spawn_raw_host,
+};
 use crate::wayland::raw_host::RawHostPointerEvent;
 
 fn verbose_paint_trace_enabled() -> bool {
@@ -283,38 +285,17 @@ fn build_host_info_event(
 
 fn collect_screen_info(window: &Window) -> HostEvent {
     let current = window.current_monitor();
-    let current_name = current.as_ref().and_then(|monitor| monitor.name());
-    let current_position = current.as_ref().map(|monitor| monitor.position());
-    let current_size = current.as_ref().map(|monitor| monitor.size());
+    let current_display_id = current
+        .as_ref()
+        .map(stable_display_id_from_monitor);
 
     let displays = window
         .available_monitors()
         .enumerate()
         .map(|(index, monitor)| {
-            let position = monitor.position();
-            let size = monitor.size();
-            let name = monitor.name();
-            let is_current = current_position.as_ref() == Some(&position)
-                && current_size.as_ref() == Some(&size)
-                && current_name == name;
-
-            DisplaySnapshot {
-                id: format!("display-{index}"),
-                name,
-                x: position.x,
-                y: position.y,
-                width: size.width,
-                height: size.height,
-                scale_factor: monitor.scale_factor(),
-                is_current,
-            }
+            display_snapshot_from_monitor(index, &monitor, current_display_id.as_deref())
         })
         .collect::<Vec<_>>();
-
-    let current_display_id = displays
-        .iter()
-        .find(|display| display.is_current)
-        .map(|display| display.id.clone());
 
     HostEvent::ScreenInfo {
         current_display_id,
@@ -322,30 +303,98 @@ fn collect_screen_info(window: &Window) -> HostEvent {
     }
 }
 
+fn sanitize_display_id_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    let output = output.trim_matches('_');
+    if output.is_empty() {
+        "unnamed".to_string()
+    } else {
+        output.to_string()
+    }
+}
+
+fn stable_display_id(name: Option<&str>, x: i32, y: i32, width: u32, height: u32, scale_factor: f64) -> String {
+    let scale_milli = (scale_factor * 1000.0).round() as i64;
+    let name = sanitize_display_id_component(name.unwrap_or("unnamed"));
+    format!("display:{name}:{x}:{y}:{width}:{height}:{scale_milli}")
+}
+
+fn stable_display_id_from_monitor(monitor: &MonitorHandle) -> String {
+    let position = monitor.position();
+    let size = monitor.size();
+    stable_display_id(
+        monitor.name().as_deref(),
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        monitor.scale_factor(),
+    )
+}
+
+fn display_snapshot_from_monitor(
+    index: usize,
+    monitor: &MonitorHandle,
+    current_display_id: Option<&str>,
+) -> DisplaySnapshot {
+    let position = monitor.position();
+    let size = monitor.size();
+    let name = monitor.name();
+    let id = stable_display_id(
+        name.as_deref(),
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        monitor.scale_factor(),
+    );
+
+    DisplaySnapshot {
+        id: id.clone(),
+        name: name.or_else(|| Some(format!("Display {}", index + 1))),
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        scale_factor: monitor.scale_factor(),
+        is_current: current_display_id == Some(id.as_str()),
+    }
+}
+
 fn find_display_for_point(window: &Window, screen_x: i32, screen_y: i32) -> Option<DisplaySnapshot> {
     window
         .available_monitors()
         .enumerate()
-        .map(|(index, monitor)| {
-            let position = monitor.position();
-            let size = monitor.size();
-            DisplaySnapshot {
-                id: format!("display-{index}"),
-                name: monitor.name(),
-                x: position.x,
-                y: position.y,
-                width: size.width,
-                height: size.height,
-                scale_factor: monitor.scale_factor(),
-                is_current: false,
-            }
-        })
+        .map(|(index, monitor)| display_snapshot_from_monitor(index, &monitor, None))
         .find(|display| {
             screen_x >= display.x
                 && screen_x < display.x + display.width as i32
                 && screen_y >= display.y
                 && screen_y < display.y + display.height as i32
         })
+}
+
+fn find_display_by_id(window: &Window, display_id: &str) -> Option<DisplaySnapshot> {
+    window
+        .available_monitors()
+        .enumerate()
+        .map(|(index, monitor)| display_snapshot_from_monitor(index, &monitor, None))
+        .find(|display| display.id == display_id)
+}
+
+fn find_monitor_by_display_id(window: &Window, display_id: &str) -> Option<MonitorHandle> {
+    window
+        .available_monitors()
+        .find(|monitor| stable_display_id_from_monitor(monitor) == display_id)
 }
 
 fn collect_window_state(window: &Window) -> HostEvent {
@@ -365,6 +414,74 @@ fn collect_window_state(window: &Window) -> HostEvent {
             focused: window.is_focused(),
         },
     }
+}
+
+fn display_snapshot_from_raw_host(display: RawHostDisplaySnapshot) -> DisplaySnapshot {
+    DisplaySnapshot {
+        id: display.id,
+        name: display.name,
+        x: display.x,
+        y: display.y,
+        width: display.width,
+        height: display.height,
+        scale_factor: display.scale_factor,
+        is_current: display.is_current,
+    }
+}
+
+fn collect_raw_screen_info(raw_host: &RawHostHandle) -> HostEvent {
+    HostEvent::ScreenInfo {
+        current_display_id: raw_host.current_output_id(),
+        displays: raw_host
+            .displays()
+            .into_iter()
+            .map(display_snapshot_from_raw_host)
+            .collect(),
+    }
+}
+
+fn collect_raw_window_state(raw_host: &RawHostHandle) -> HostEvent {
+    let state = raw_host.window_state();
+    HostEvent::WindowState {
+        state: WindowStateSnapshot {
+            x: state.x,
+            y: state.y,
+            width: state.width,
+            height: state.height,
+            scale_factor: state.scale_factor,
+            fullscreen: state.fullscreen,
+            maximized: false,
+            visible: state.visible,
+            focused: true,
+        },
+    }
+}
+
+fn build_raw_cef_init_script() -> String {
+    format!(
+        r#"(function() {{
+if (window.__NEKO_RAW_CEF_HOST_BRIDGE_INSTALLED__) return;
+window.__NEKO_RAW_CEF_HOST_BRIDGE_INSTALLED__ = true;
+function __nekoEncodeUtf8Base64(input) {{
+  const bytes = new TextEncoder().encode(String(input));
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {{
+    const slice = bytes.subarray(i, i + chunk);
+    binary += String.fromCharCode.apply(null, Array.from(slice));
+  }}
+  return btoa(binary);
+}}
+window.ipc = window.ipc || {{
+  postMessage(message) {{
+    const payload = typeof message === 'string' ? message : JSON.stringify(message);
+    console.log('NEKO_FRONTEND_IPC_B64:' + __nekoEncodeUtf8Base64(payload));
+  }}
+}};
+{init}
+}})();"#,
+        init = init_script()
+    )
 }
 
 fn monitor_matches_name(monitor: &MonitorHandle, expected: &str) -> bool {
@@ -398,6 +515,22 @@ fn select_target_monitor(
     let monitors = event_loop.available_monitors().collect::<Vec<_>>();
     if monitors.is_empty() {
         return None;
+    }
+
+    if let Some(display_id) = config.target_display_id.as_deref() {
+        if let Some(monitor) = monitors
+            .iter()
+            .find(|monitor| stable_display_id_from_monitor(monitor) == display_id)
+            .cloned()
+        {
+            eprintln!(
+                "selected target display by id {:?}: {}",
+                display_id,
+                describe_monitor(&monitor)
+            );
+            return Some(monitor);
+        }
+        eprintln!("requested display id {:?} was not found; falling back", display_id);
     }
 
     if let Some(index) = config.target_display_index {
@@ -612,7 +745,7 @@ pub fn run(config: AppConfig) -> Result<()> {
 
     if matches!(config.wayland_host_mode, WaylandHostMode::CStandaloneProbe) {
         eprintln!("running in C standalone helper probe mode");
-        return run_c_standalone_probe(&config);
+        return run_c_standalone_probe(&config, &profile, &strategy);
     }
 
     let launcher_runtime = launcher::start_launcher(&config.repo_root)?;
@@ -808,6 +941,38 @@ pub fn run(config: AppConfig) -> Result<()> {
                                         .unwrap_or_else(|| PhysicalPosition::new(screen_x, screen_y));
                                 window.set_outer_position(target_position);
                                 Some(collect_window_state(window))
+                            } else {
+                                Some(HostEvent::Error {
+                                    message: "no active window available to move".to_string(),
+                                })
+                            }
+                        }
+                        HostRequest::MoveWindowToDisplayId { display_id } => {
+                            if let Some(window) = main_window {
+                                if let Some(display) = find_display_by_id(window, &display_id) {
+                                    let target_position =
+                                        PhysicalPosition::new(display.x, display.y);
+                                    let target_monitor =
+                                        find_monitor_by_display_id(window, &display_id);
+                                    let is_fullscreen = window.fullscreen().is_some();
+                                    if is_fullscreen {
+                                        window.set_fullscreen(None);
+                                    }
+                                    window.set_outer_position(target_position);
+                                    if is_fullscreen {
+                                        window.set_fullscreen(Some(Fullscreen::Borderless(
+                                            target_monitor,
+                                        )));
+                                    }
+                                    Some(collect_window_state(window))
+                                } else {
+                                    Some(HostEvent::Error {
+                                        message: format!(
+                                            "display id {:?} was not found",
+                                            display_id
+                                        ),
+                                    })
+                                }
                             } else {
                                 Some(HostEvent::Error {
                                     message: "no active window available to move".to_string(),
@@ -1266,7 +1431,138 @@ fn should_request_official_helper_probe_shutdown() -> bool {
     )
 }
 
-fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
+fn handle_raw_host_request(
+    request: HostRequest,
+    raw_host: &RawHostHandle,
+    profile: &WaylandProfile,
+    strategy: &StrategySelection,
+    dark_mode_enabled: &mut bool,
+) -> Option<HostEvent> {
+    match request {
+        HostRequest::GetHostInfo => {
+            Some(build_host_info_event(profile, strategy, *dark_mode_enabled))
+        }
+        HostRequest::GetScreenInfo => Some(collect_raw_screen_info(raw_host)),
+        HostRequest::GetWindowState => Some(collect_raw_window_state(raw_host)),
+        HostRequest::GetDarkMode => Some(HostEvent::DarkModeChanged {
+            enabled: *dark_mode_enabled,
+        }),
+        HostRequest::SetDarkMode { enabled } => {
+            *dark_mode_enabled = enabled;
+            Some(HostEvent::DarkModeChanged { enabled })
+        }
+        HostRequest::OpenExternal { url } => match open_external_url(&url) {
+            Ok(()) => Some(HostEvent::ExternalOpened { url }),
+            Err(err) => Some(HostEvent::Error {
+                message: format!("failed to open external url: {err}"),
+            }),
+        },
+        HostRequest::GetClipboardText => match read_clipboard_text() {
+            Ok(text) => Some(HostEvent::ClipboardText { text }),
+            Err(err) => Some(HostEvent::Error {
+                message: format!("failed to read clipboard text: {err}"),
+            }),
+        },
+        HostRequest::SetClipboardText { text } => match write_clipboard_text(&text) {
+            Ok(text) => Some(HostEvent::ClipboardText { text }),
+            Err(err) => Some(HostEvent::Error {
+                message: format!("failed to write clipboard text: {err}"),
+            }),
+        },
+        HostRequest::MoveWindowToDisplay { screen_x, screen_y } => {
+            let target = raw_host.displays().into_iter().find(|display| {
+                screen_x >= display.x
+                    && screen_x < display.x + display.width as i32
+                    && screen_y >= display.y
+                    && screen_y < display.y + display.height as i32
+            });
+            match target {
+                Some(display) => match raw_host.set_target_output_id(Some(display.id)) {
+                    Ok(()) => Some(collect_raw_window_state(raw_host)),
+                    Err(err) => Some(HostEvent::Error {
+                        message: format!("failed to move raw host to display: {err}"),
+                    }),
+                },
+                None => Some(HostEvent::Error {
+                    message: format!(
+                        "no raw-host display contains point ({screen_x}, {screen_y})"
+                    ),
+                }),
+            }
+        }
+        HostRequest::MoveWindowToDisplayId { display_id } => {
+            match raw_host.set_target_output_id(Some(display_id)) {
+                Ok(()) => Some(collect_raw_window_state(raw_host)),
+                Err(err) => Some(HostEvent::Error {
+                    message: format!("failed to move raw host to display id: {err}"),
+                }),
+            }
+        }
+        HostRequest::OpenFileDialog {
+            directory,
+            multiple,
+            title,
+            filters,
+        } => Some(HostEvent::FileDialogResult {
+            paths: open_file_dialog(directory, multiple, title.as_deref(), &filters),
+        }),
+        HostRequest::SaveFileDialog {
+            title,
+            suggested_name,
+            directory,
+            filters,
+        } => Some(HostEvent::SaveDialogResult {
+            path: save_file_dialog(
+                title.as_deref(),
+                suggested_name.as_deref(),
+                directory.as_deref(),
+                &filters,
+            ),
+        }),
+        HostRequest::ReadFile { path } => match read_file_payload(&path) {
+            Ok(event) => Some(event),
+            Err(err) => Some(HostEvent::Error {
+                message: format!("failed to read file {path}: {err}"),
+            }),
+        },
+        HostRequest::WriteFile {
+            path,
+            content_base64,
+        } => match write_file_payload(&path, &content_base64) {
+            Ok(event) => Some(event),
+            Err(err) => Some(HostEvent::Error {
+                message: format!("failed to write file {path}: {err}"),
+            }),
+        },
+    }
+}
+
+fn sync_raw_host_frontend_state(
+    helper: &mut CStandaloneHelperHandle,
+    raw_host: &RawHostHandle,
+    last_screen_script: &mut Option<String>,
+    last_window_script: &mut Option<String>,
+) -> Result<()> {
+    let screen_script = build_emit_script(&collect_raw_screen_info(raw_host))?;
+    if last_screen_script.as_ref() != Some(&screen_script) {
+        helper.send_eval_script(&screen_script)?;
+        *last_screen_script = Some(screen_script);
+    }
+
+    let window_script = build_emit_script(&collect_raw_window_state(raw_host))?;
+    if last_window_script.as_ref() != Some(&window_script) {
+        helper.send_eval_script(&window_script)?;
+        *last_window_script = Some(window_script);
+    }
+
+    Ok(())
+}
+
+fn run_c_standalone_probe(
+    config: &AppConfig,
+    profile: &WaylandProfile,
+    strategy: &StrategySelection,
+) -> Result<()> {
     let launcher_runtime = launcher::start_launcher(&config.repo_root)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
     let frontend_url = frontend_ports
@@ -1388,6 +1684,11 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
     let helper_event_wait = Duration::from_millis(helper_event_wait_ms(config.render_fps));
     let mut helper_shutdown_started = false;
     let mut helper_shutdown_deadline = None::<Instant>;
+    let mut dark_mode_enabled = false;
+    let mut raw_cef_host_bridge_installed = false;
+    let raw_cef_host_init_script = build_raw_cef_init_script();
+    let mut last_raw_screen_script = None::<String>;
+    let mut last_raw_window_script = None::<String>;
 
     loop {
         if !raw_host_handle.is_running() && !stop_requested.load(Ordering::Relaxed) {
@@ -1446,19 +1747,104 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
         }
 
         if let Some(event) = helper.recv_event_timeout(helper_event_wait)? {
-            apply_c_standalone_event(
-                event,
-                &mut saw_initialize_ok,
-                &mut saw_browser_created,
-                &mut saw_load_end,
-                &mut saw_shutdown_ok,
-                frame_push_interval,
-                &mut last_frame_push_at,
-                &mut last_frontend_input_region,
-                &mut last_frontend_input_region_applied_at,
-                &mut last_frontend_drag_region,
-                &mut last_frontend_drag_exclusion_region,
-                Some((&raw_host_handle, &frame_delivery)),
+            match event {
+                CStandaloneHelperEvent::LoadEnd { http_status_code } => {
+                    if http_status_code >= 200 && http_status_code < 400 && !raw_cef_host_bridge_installed {
+                        helper.send_eval_script(&raw_cef_host_init_script)?;
+                        raw_cef_host_bridge_installed = true;
+
+                        let ready_event = HostEvent::Ready {
+                            profile: WaylandProfileSnapshot::from(profile),
+                            strategy: StrategySelectionSnapshot::from(strategy),
+                            capabilities: host_capabilities(),
+                            dark_mode: dark_mode_enabled,
+                        };
+                        helper.send_eval_script(&build_emit_script(&ready_event)?)?;
+                        sync_raw_host_frontend_state(
+                            &mut helper,
+                            &raw_host_handle,
+                            &mut last_raw_screen_script,
+                            &mut last_raw_window_script,
+                        )?;
+                    }
+
+                    apply_c_standalone_event(
+                        CStandaloneHelperEvent::LoadEnd { http_status_code },
+                        &mut saw_initialize_ok,
+                        &mut saw_browser_created,
+                        &mut saw_load_end,
+                        &mut saw_shutdown_ok,
+                        frame_push_interval,
+                        &mut last_frame_push_at,
+                        &mut last_frontend_input_region,
+                        &mut last_frontend_input_region_applied_at,
+                        &mut last_frontend_drag_region,
+                        &mut last_frontend_drag_exclusion_region,
+                        Some((&raw_host_handle, &frame_delivery)),
+                    )?;
+                }
+                CStandaloneHelperEvent::FrontendIpc { payload_b64 } => {
+                    let decoded = BASE64
+                        .decode(payload_b64)
+                        .context("failed to decode raw CEF frontend IPC payload")?;
+                    let raw = String::from_utf8(decoded)
+                        .context("raw CEF frontend IPC payload was not valid UTF-8")?;
+                    match handle_frontend_message(&raw) {
+                        HostAction::Emit(event) => {
+                            helper.send_eval_script(&build_emit_script(&event)?)?;
+                        }
+                        HostAction::ApplyInputRegion(region) => {
+                            raw_host_handle.set_input_region(region.clone())?;
+                            helper.send_eval_script(&build_emit_script(&HostEvent::InputRegionApplied {
+                                rect_count: region.rects().len(),
+                            })?)?;
+                        }
+                        HostAction::Request(request) => {
+                            if let Some(event) = handle_raw_host_request(
+                                request,
+                                &raw_host_handle,
+                                profile,
+                                strategy,
+                                &mut dark_mode_enabled,
+                            ) {
+                                helper.send_eval_script(&build_emit_script(&event)?)?;
+                                if matches!(event, HostEvent::WindowState { .. } | HostEvent::ScreenInfo { .. }) {
+                                    sync_raw_host_frontend_state(
+                                        &mut helper,
+                                        &raw_host_handle,
+                                        &mut last_raw_screen_script,
+                                        &mut last_raw_window_script,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+                other => {
+                    apply_c_standalone_event(
+                        other,
+                        &mut saw_initialize_ok,
+                        &mut saw_browser_created,
+                        &mut saw_load_end,
+                        &mut saw_shutdown_ok,
+                        frame_push_interval,
+                        &mut last_frame_push_at,
+                        &mut last_frontend_input_region,
+                        &mut last_frontend_input_region_applied_at,
+                        &mut last_frontend_drag_region,
+                        &mut last_frontend_drag_exclusion_region,
+                        Some((&raw_host_handle, &frame_delivery)),
+                    )?;
+                }
+            }
+        }
+
+        if raw_cef_host_bridge_installed {
+            sync_raw_host_frontend_state(
+                &mut helper,
+                &raw_host_handle,
+                &mut last_raw_screen_script,
+                &mut last_raw_window_script,
             )?;
         }
 
@@ -1736,6 +2122,7 @@ fn apply_c_standalone_event(
         CStandaloneHelperEvent::SubprocessExit { code } => {
             eprintln!("C standalone helper event: subprocess_exit code={code}");
         }
+        CStandaloneHelperEvent::FrontendIpc { .. } => {}
         CStandaloneHelperEvent::RawLine { event, fields } => {
             eprintln!("C standalone helper event: {event} fields={fields:?}");
         }
@@ -1785,6 +2172,7 @@ fn build_raw_host_config(
     raw_host_config.width = config.window_width;
     raw_host_config.height = config.window_height;
     raw_host_config.fullscreen = config.fullscreen;
+    raw_host_config.target_output_id = config.target_display_id.clone();
     raw_host_config.target_output_index = config.target_display_index;
     raw_host_config.target_output_name = config.target_display_name.clone();
     raw_host_config.input_region = if initial_region.is_empty() {

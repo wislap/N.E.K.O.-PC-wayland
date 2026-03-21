@@ -10,6 +10,8 @@ use std::time::Duration;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::from_str;
 use xkeysym::key;
 
@@ -52,6 +54,9 @@ pub enum CStandaloneHelperEvent {
     },
     DragExclusionRegion {
         rects: Vec<InteractiveRectPayload>,
+    },
+    FrontendIpc {
+        payload_b64: String,
     },
     BrowserBeforeClose,
     BrowserReleased,
@@ -357,6 +362,11 @@ impl CStandaloneHelperHandle {
         self.send_line("shutdown")
     }
 
+    pub fn send_eval_script(&mut self, script: &str) -> Result<()> {
+        let script_b64 = BASE64.encode(script.as_bytes());
+        self.send_line(format!("eval_b64 script_b64={script_b64}"))
+    }
+
     fn send_line(&mut self, line: impl AsRef<str>) -> Result<()> {
         let line = line.as_ref();
         if input_trace_enabled() {
@@ -472,6 +482,11 @@ fn parse_event_line(payload: &str) -> Option<CStandaloneHelperEvent> {
             rects: field_value(&fields, "rects")
                 .and_then(|value| from_str::<Vec<InteractiveRectPayload>>(value).ok())
                 .unwrap_or_default(),
+        },
+        "frontend_ipc" => CStandaloneHelperEvent::FrontendIpc {
+            payload_b64: field_value(&fields, "payload_b64")
+                .unwrap_or_default()
+                .to_string(),
         },
         "browser_before_close" => CStandaloneHelperEvent::BrowserBeforeClose,
         "browser_released" => CStandaloneHelperEvent::BrowserReleased,

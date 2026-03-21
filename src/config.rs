@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub render_fps: u32,
     pub fullscreen: bool,
     pub transparent_background: bool,
+    pub target_display_id: Option<String>,
     pub target_display_index: Option<usize>,
     pub target_display_name: Option<String>,
 }
@@ -64,6 +65,7 @@ impl AppConfig {
             render_fps: parse_dimension("NEKO_WAYLAND_RENDER_FPS", default_render_fps())?,
             fullscreen: parse_fullscreen_flag(),
             transparent_background: parse_transparent_background_flag(),
+            target_display_id: parse_optional_nonempty_string("NEKO_WAYLAND_DISPLAY_ID"),
             target_display_index: parse_optional_usize("NEKO_WAYLAND_DISPLAY_INDEX")?,
             target_display_name: parse_optional_nonempty_string("NEKO_WAYLAND_DISPLAY_NAME"),
         })
