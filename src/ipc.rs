@@ -345,6 +345,8 @@ pub fn init_script() -> &'static str {
       name: display.name || ('Display ' + (index + 1)),
       x: display.x,
       y: display.y,
+      screenX: display.x,
+      screenY: display.y,
       width: display.width,
       height: display.height,
       bounds: { x: display.x, y: display.y, width: display.width, height: display.height },
@@ -402,12 +404,33 @@ pub fn init_script() -> &'static str {
     setClipboardText(text) {
       return waitForEvent('clipboard_text', { cmd: 'set_clipboard_text', text: String(text) }).then((payload) => payload.text ?? '');
     },
-    moveWindowToDisplay(screenX, screenY) {
-      return waitForEvent('window_state', {
+    async moveWindowToDisplay(screenX, screenY) {
+      const targetX = Math.trunc(screenX);
+      const targetY = Math.trunc(screenY);
+      const displaysBefore = await getMappedDisplays();
+      const before = await window.electronScreen.getCurrentDisplay();
+      const target = displaysBefore.find((display) =>
+        targetX >= display.x && targetX < display.x + display.width &&
+        targetY >= display.y && targetY < display.y + display.height
+      ) || null;
+      const state = await waitForEvent('window_state', {
         cmd: 'move_window_to_display',
-        screen_x: Math.trunc(screenX),
-        screen_y: Math.trunc(screenY),
+        screen_x: targetX,
+        screen_y: targetY,
       });
+      const after = await window.electronScreen.getCurrentDisplay();
+      const sameDisplay = !!(before && after && before.id === after.id);
+      const beforeScale = before && before.scaleFactor ? before.scaleFactor : 1;
+      const afterScale = after && after.scaleFactor ? after.scaleFactor : 1;
+      return {
+        success: !!state,
+        sameDisplay,
+        state,
+        displayId: after ? after.id : (target ? target.id : null),
+        screenX: after ? after.x : (target ? target.x : targetX),
+        screenY: after ? after.y : (target ? target.y : targetY),
+        scaleRatio: beforeScale ? (afterScale / beforeScale) : 1,
+      };
     },
     openFileDialog(options = {}) {
       return waitForEvent('file_dialog_result', {

@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub render_fps: u32,
     pub fullscreen: bool,
     pub transparent_background: bool,
+    pub target_display_index: Option<usize>,
+    pub target_display_name: Option<String>,
 }
 
 impl AppConfig {
@@ -61,7 +63,9 @@ impl AppConfig {
             )?,
             render_fps: parse_dimension("NEKO_WAYLAND_RENDER_FPS", default_render_fps())?,
             fullscreen: parse_fullscreen_flag(),
-            transparent_background: env_flag("NEKO_WAYLAND_TRANSPARENT_BACKGROUND"),
+            transparent_background: parse_transparent_background_flag(),
+            target_display_index: parse_optional_usize("NEKO_WAYLAND_DISPLAY_INDEX")?,
+            target_display_name: parse_optional_nonempty_string("NEKO_WAYLAND_DISPLAY_NAME"),
         })
     }
 }
@@ -93,6 +97,25 @@ fn parse_dimension(name: &str, default: u32) -> Result<u32> {
     Ok(value)
 }
 
+fn parse_optional_usize(name: &str) -> Result<Option<usize>> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = raw
+        .to_string_lossy()
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid {name} value {:?}", raw))?;
+    Ok(Some(value))
+}
+
+fn parse_optional_nonempty_string(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn parse_fullscreen_flag() -> bool {
     match env::var("NEKO_WAYLAND_FULLSCREEN") {
         Ok(value) => matches!(
@@ -100,6 +123,16 @@ fn parse_fullscreen_flag() -> bool {
             "1" | "true" | "yes" | "on"
         ),
         Err(_) => false,
+    }
+}
+
+fn parse_transparent_background_flag() -> bool {
+    match env::var("NEKO_WAYLAND_TRANSPARENT_BACKGROUND") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
     }
 }
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
-use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop::channel::{
     Event as ChannelEvent, Sender as ChannelSender, channel,
@@ -57,8 +57,12 @@ pub struct RawHostConfig {
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
+    pub target_output_index: Option<usize>,
+    pub target_output_name: Option<String>,
     pub input_region_source_size: Option<(u32, u32)>,
     pub input_region: InputRegion,
+    pub drag_region: InputRegion,
+    pub drag_exclusion_region: InputRegion,
     pub visible_region: Option<InputRegion>,
     pub transparent_outside_input_region: bool,
     pub show_debug_regions_when_empty: bool,
@@ -193,6 +197,8 @@ impl RawHostConfig {
             width: 800,
             height: 600,
             fullscreen: false,
+            target_output_index: None,
+            target_output_name: None,
             input_region_source_size: None,
             input_region: InputRegion::from_rects(vec![InteractiveRect {
                 x: 0,
@@ -200,6 +206,8 @@ impl RawHostConfig {
                 width: 220,
                 height: 320,
             }]),
+            drag_region: InputRegion::default(),
+            drag_exclusion_region: InputRegion::default(),
             visible_region: None,
             transparent_outside_input_region: true,
             show_debug_regions_when_empty: true,
@@ -314,7 +322,6 @@ fn run_inner_with_running(
     if config.fullscreen {
         window.set_min_size(None);
         window.set_max_size(None);
-        window.set_fullscreen(None);
     } else {
         window.set_min_size(Some((config.width, config.height)));
         window.set_max_size(Some((config.width, config.height)));
@@ -350,6 +357,8 @@ fn run_inner_with_running(
             width: config.width,
             height: config.height,
             fullscreen: config.fullscreen,
+            target_output_index: config.target_output_index,
+            target_output_name: config.target_output_name.clone(),
             input_region_source_size: config.input_region_source_size,
             source_input_region: config.input_region.clone(),
             input_region: scale_input_region_to_window(
@@ -358,10 +367,25 @@ fn run_inner_with_running(
                 config.width,
                 config.height,
             ),
+            source_drag_region: config.drag_region.clone(),
+            drag_region: scale_input_region_to_window(
+                &config.drag_region,
+                config.input_region_source_size,
+                config.width,
+                config.height,
+            ),
+            source_drag_exclusion_region: config.drag_exclusion_region.clone(),
+            drag_exclusion_region: scale_input_region_to_window(
+                &config.drag_exclusion_region,
+                config.input_region_source_size,
+                config.width,
+                config.height,
+            ),
             visible_region: config.visible_region.clone(),
             frame: None,
             shared_frame_reader: None,
             shared_frame: None,
+            fullscreen_output_applied: false,
             input_region_applied: false,
             transparent_outside_input_region: config.transparent_outside_input_region,
             show_debug_regions_when_empty: config.show_debug_regions_when_empty,
@@ -375,6 +399,7 @@ fn run_inner_with_running(
         pointer: None,
         keyboard: None,
         pointer_inside: false,
+        window_move_active: false,
         running,
         surface_size,
         latest_frame,
@@ -383,6 +408,8 @@ fn run_inner_with_running(
         keyboard_subscribers,
         modifiers: RawHostModifiers::default(),
     };
+
+    app.apply_fullscreen_output_preference();
 
     if let Some(command_channel) = commands {
         event_loop
@@ -459,6 +486,18 @@ impl RawHostHandle {
             .map_err(|err| anyhow!("failed to send input-region update to raw host: {err}"))
     }
 
+    pub fn set_drag_region(&self, region: InputRegion) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::SetDragRegion(region))
+            .map_err(|err| anyhow!("failed to send drag-region update to raw host: {err}"))
+    }
+
+    pub fn set_drag_exclusion_region(&self, region: InputRegion) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::SetDragExclusionRegion(region))
+            .map_err(|err| anyhow!("failed to send drag-exclusion-region update to raw host: {err}"))
+    }
+
     pub fn set_visible_region(&self, region: Option<InputRegion>) -> Result<()> {
         self.sender
             .send(RawHostCommand::SetVisibleRegion(region))
@@ -478,9 +517,12 @@ impl RawHostHandle {
     }
 
     pub fn refresh_shared_frame(&self, width: u32, height: u32) -> Result<()> {
-        self.sender
-            .send(RawHostCommand::RefreshSharedFrame { width, height })
-            .map_err(|err| anyhow!("failed to request shared frame refresh in raw host: {err}"))
+        if !self.frame_update_pending.swap(true, Ordering::SeqCst) {
+            self.sender
+                .send(RawHostCommand::RefreshSharedFrame { width, height })
+                .map_err(|err| anyhow!("failed to request shared frame refresh in raw host: {err}"))?;
+        }
+        Ok(())
     }
 
     pub fn set_rgba_frame(&self, frame: RawHostFrame) -> Result<()> {
@@ -538,6 +580,8 @@ impl RawHostHandle {
 #[derive(Debug)]
 enum RawHostCommand {
     SetInputRegion(InputRegion),
+    SetDragRegion(InputRegion),
+    SetDragExclusionRegion(InputRegion),
     SetVisibleRegion(Option<InputRegion>),
     AttachSharedFrameReader(SharedFrameReader),
     RefreshSharedFrame {
@@ -554,13 +598,20 @@ struct RawHostRuntime {
     width: u32,
     height: u32,
     fullscreen: bool,
+    target_output_index: Option<usize>,
+    target_output_name: Option<String>,
     input_region_source_size: Option<(u32, u32)>,
     source_input_region: InputRegion,
     input_region: InputRegion,
+    source_drag_region: InputRegion,
+    drag_region: InputRegion,
+    source_drag_exclusion_region: InputRegion,
+    drag_exclusion_region: InputRegion,
     visible_region: Option<InputRegion>,
     frame: Option<RawHostFrame>,
     shared_frame_reader: Option<SharedFrameReader>,
     shared_frame: Option<RawHostFrame>,
+    fullscreen_output_applied: bool,
     input_region_applied: bool,
     transparent_outside_input_region: bool,
     show_debug_regions_when_empty: bool,
@@ -586,6 +637,7 @@ struct RawHostApp {
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer_inside: bool,
+    window_move_active: bool,
     running: Arc<AtomicBool>,
     surface_size: Arc<Mutex<(u32, u32)>>,
     latest_frame: Arc<Mutex<Option<RawHostFrame>>>,
@@ -596,6 +648,104 @@ struct RawHostApp {
 }
 
 impl RawHostApp {
+    fn output_matches_name(info: &OutputInfo, expected: &str) -> bool {
+        let expected = expected.trim().to_ascii_lowercase();
+        if expected.is_empty() {
+            return false;
+        }
+        [
+            info.name.as_deref(),
+            info.description.as_deref(),
+            Some(info.model.as_str()),
+            Some(info.make.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == expected || value.contains(&expected)
+        })
+    }
+
+    fn describe_output(info: Option<&OutputInfo>) -> String {
+        match info {
+            Some(info) => {
+                let name = info.name.as_deref().unwrap_or("<unnamed>");
+                let (x, y) = info.logical_position.unwrap_or(info.location);
+                let (width, height) = info.logical_size.unwrap_or_else(|| {
+                    info.modes
+                        .iter()
+                        .find(|mode| mode.current)
+                        .map(|mode| mode.dimensions)
+                        .unwrap_or((0, 0))
+                });
+                format!("{name} @ {}x{}+{},{}", width, height, x, y)
+            }
+            None => "<pending-output-info>".to_string(),
+        }
+    }
+
+    fn apply_fullscreen_output_preference(&mut self) {
+        if !self.runtime.fullscreen || self.runtime.fullscreen_output_applied {
+            return;
+        }
+
+        let outputs = self.output_state.outputs().collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return;
+        }
+
+        let selected = if let Some(index) = self.runtime.target_output_index {
+            outputs
+                .get(index)
+                .cloned()
+                .map(|output| (output.clone(), self.output_state.info(&output)))
+        } else if let Some(expected_name) = self.runtime.target_output_name.as_deref() {
+            outputs.iter().find_map(|output| {
+                let info = self.output_state.info(output);
+                info.as_ref()
+                    .filter(|info| Self::output_matches_name(info, expected_name))
+                    .map(|info| (output.clone(), Some(info.clone())))
+            })
+        } else {
+            None
+        };
+
+        if let Some((output, info)) = selected {
+            self.window.set_fullscreen(Some(&output));
+            self.window.commit();
+            self.runtime.fullscreen_output_applied = true;
+            eprintln!(
+                "raw host fullscreen target applied: {}",
+                Self::describe_output(info.as_ref())
+            );
+            return;
+        }
+
+        if self.runtime.target_output_name.is_some()
+            && outputs.iter().any(|output| self.output_state.info(output).is_none())
+        {
+            return;
+        }
+
+        self.window.set_fullscreen(None);
+        self.window.commit();
+        self.runtime.fullscreen_output_applied = true;
+        if let Some(index) = self.runtime.target_output_index {
+            eprintln!(
+                "raw host target output index {} not found; using compositor default fullscreen output",
+                index
+            );
+        } else if let Some(name) = self.runtime.target_output_name.as_deref() {
+            eprintln!(
+                "raw host target output name {:?} not found; using compositor default fullscreen output",
+                name
+            );
+        } else {
+            eprintln!("raw host fullscreen using compositor default output");
+        }
+    }
+
     fn broadcast_pointer_event(&self, event: RawHostPointerEvent) {
         let mut subscribers = self
             .pointer_subscribers
@@ -624,6 +774,24 @@ impl RawHostApp {
                 );
                 self.runtime.input_region_applied = false;
                 self.apply_input_region()?;
+            }
+            RawHostCommand::SetDragRegion(region) => {
+                self.runtime.source_drag_region = region;
+                self.runtime.drag_region = scale_input_region_to_window(
+                    &self.runtime.source_drag_region,
+                    self.runtime.input_region_source_size,
+                    self.runtime.width,
+                    self.runtime.height,
+                );
+            }
+            RawHostCommand::SetDragExclusionRegion(region) => {
+                self.runtime.source_drag_exclusion_region = region;
+                self.runtime.drag_exclusion_region = scale_input_region_to_window(
+                    &self.runtime.source_drag_exclusion_region,
+                    self.runtime.input_region_source_size,
+                    self.runtime.width,
+                    self.runtime.height,
+                );
             }
             RawHostCommand::SetVisibleRegion(region) => {
                 self.runtime.visible_region = region;
@@ -687,6 +855,7 @@ impl RawHostApp {
 
     fn refresh_shared_frame(&mut self, width: u32, height: u32) -> Result<()> {
         let Some(reader) = self.runtime.shared_frame_reader.as_ref() else {
+            self.frame_update_pending.store(false, Ordering::SeqCst);
             return Ok(());
         };
 
@@ -701,7 +870,9 @@ impl RawHostApp {
         frame.height = loaded_height;
         self.runtime.shared_frame = Some(frame);
         self.runtime.frame = None;
-        self.draw()
+        let result = self.draw();
+        self.frame_update_pending.store(false, Ordering::SeqCst);
+        result
     }
 
     fn apply_input_region(&mut self) -> Result<()> {
@@ -855,6 +1026,18 @@ fn point_in_rect(x: i32, y: i32, rect: &crate::wayland::input_region::Interactiv
     let right = rect.x.saturating_add(rect.width as i32);
     let bottom = rect.y.saturating_add(rect.height as i32);
     x >= rect.x && y >= rect.y && x < right && y < bottom
+}
+
+fn point_in_region(x: i32, y: i32, region: &InputRegion) -> bool {
+    region.rects().iter().any(|rect| point_in_rect(x, y, rect))
+}
+
+fn point_in_default_drag_strip(x: i32, y: i32, width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let strip_height = height.min(48) as i32;
+    x >= 0 && y >= 0 && x < width as i32 && y < strip_height
 }
 
 fn scale_input_region_to_window(
@@ -1111,6 +1294,7 @@ impl OutputHandler for RawHostApp {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        self.apply_fullscreen_output_preference();
     }
 
     fn update_output(
@@ -1119,6 +1303,7 @@ impl OutputHandler for RawHostApp {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        self.apply_fullscreen_output_preference();
     }
 
     fn output_destroyed(
@@ -1171,6 +1356,18 @@ impl WindowHandler for RawHostApp {
             self.runtime.width,
             self.runtime.height,
         );
+        self.runtime.drag_region = scale_input_region_to_window(
+            &self.runtime.source_drag_region,
+            self.runtime.input_region_source_size,
+            self.runtime.width,
+            self.runtime.height,
+        );
+        self.runtime.drag_exclusion_region = scale_input_region_to_window(
+            &self.runtime.source_drag_exclusion_region,
+            self.runtime.input_region_source_size,
+            self.runtime.width,
+            self.runtime.height,
+        );
         if size_changed {
             self.runtime.input_region_applied = false;
             if self.runtime.log_pointer_events {
@@ -1193,6 +1390,8 @@ impl WindowHandler for RawHostApp {
         if self.first_configure {
             self.first_configure = false;
         }
+
+        self.apply_fullscreen_output_preference();
 
         if (!size_changed && !was_first_configure) || self.exit {
             return;
@@ -1402,6 +1601,7 @@ impl PointerHandler for RawHostApp {
                 }
                 PointerEventKind::Leave { serial } => {
                     self.pointer_inside = false;
+                    self.window_move_active = false;
                     self.broadcast_pointer_event(RawHostPointerEvent::Leave {
                         x: event.position.0,
                         y: event.position.1,
@@ -1420,14 +1620,41 @@ impl PointerHandler for RawHostApp {
                     }
                 }
                 PointerEventKind::Press { button, serial, .. } => {
-                    if self.runtime.move_on_left_press && button == BTN_LEFT {
+                    let pointer_x = event.position.0.round() as i32;
+                    let pointer_y = event.position.1.round() as i32;
+                    let in_drag_region = point_in_region(
+                        pointer_x,
+                        pointer_y,
+                        &self.runtime.drag_region,
+                    ) && !point_in_region(
+                        pointer_x,
+                        pointer_y,
+                        &self.runtime.drag_exclusion_region,
+                    );
+                    let use_fallback_drag_strip = self.runtime.drag_region.is_empty()
+                        && point_in_default_drag_strip(
+                            pointer_x,
+                            pointer_y,
+                            self.runtime.width,
+                            self.runtime.height,
+                        );
+                    if (self.runtime.move_on_left_press || in_drag_region || use_fallback_drag_strip)
+                        && button == BTN_LEFT
+                    {
                         if let Some(pointer_data) = pointer.data::<PointerData>() {
                             let seat = pointer_data.seat();
                             self.window.move_(seat, serial);
+                            self.window_move_active = in_drag_region || use_fallback_drag_strip;
                             eprintln!(
-                                "started xdg_toplevel move via input region: serial={} pos={:?}",
-                                serial, event.position
+                                "started xdg_toplevel move via host drag region: serial={} pos={:?} explicit_drag={} fallback_drag={}",
+                                serial,
+                                event.position,
+                                in_drag_region,
+                                use_fallback_drag_strip
                             );
+                        }
+                        if in_drag_region || use_fallback_drag_strip {
+                            continue;
                         }
                     }
                     self.broadcast_pointer_event(RawHostPointerEvent::Button {
@@ -1444,6 +1671,10 @@ impl PointerHandler for RawHostApp {
                     }
                 }
                 PointerEventKind::Release { button, serial, .. } => {
+                    if self.window_move_active && button == BTN_LEFT {
+                        self.window_move_active = false;
+                        continue;
+                    }
                     self.broadcast_pointer_event(RawHostPointerEvent::Button {
                         x: event.position.0,
                         y: event.position.1,

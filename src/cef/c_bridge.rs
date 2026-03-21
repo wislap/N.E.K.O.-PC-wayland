@@ -8,6 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+#[cfg(has_cef_sdk)]
+use anyhow::Context;
 use xkeysym::key;
 
 use crate::cef::bootstrap::CefRuntimePlan;

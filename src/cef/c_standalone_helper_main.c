@@ -413,7 +413,10 @@ static void on_load_end(void* user_data, int http_status_code) {
         "'.live2d-popup','.vrm-popup','[id^=\"live2d-popup-\"]','[id^=\"vrm-popup-\"]',"
         "'[data-neko-sidepanel]','[data-neko-sidepanel-owner]','[data-neko-interactive]'];"
         "let last='';"
+        "let lastDrag='';"
+        "let lastNoDrag='';"
         "let scheduled=false;"
+        "let timer=0;"
         "function interactiveTag(el){"
         "const text=[el.id||'',el.className||'',el.getAttribute('role')||'',"
         "el.getAttribute('data-action')||'',(el.parentElement&&el.parentElement.id)||'',"
@@ -439,6 +442,10 @@ static void on_load_end(void* user_data, int http_status_code) {
         "node=node.parentElement;"
         "}"
         "return true;"
+        "}"
+        "function appRegion(el){"
+        "const style=getComputedStyle(el);"
+        "return (style.getPropertyValue('-webkit-app-region')||style.getPropertyValue('app-region')||style.webkitAppRegion||'').trim().toLowerCase();"
         "}"
         "function addRect(rects,r){"
         "const left=Math.max(0,Math.round(r.left));"
@@ -553,9 +560,19 @@ static void on_load_end(void* user_data, int http_status_code) {
         "function collect(){"
         "scheduled=false;"
         "const rects=[];"
+        "const dragRects=[];"
+        "const noDragRects=[];"
         "const seen=new Set();"
         "addLive2DModelRect(rects);"
         "addVrmModelRect(rects);"
+        "for(const el of document.querySelectorAll('body *')){"
+        "if(!el||!visibleAndEnabled(el)||!acceptsPointer(el))continue;"
+        "const region=appRegion(el);"
+        "if(region!=='drag'&&region!=='no-drag')continue;"
+        "const r=el.getBoundingClientRect();"
+        "if(region==='drag')addRect(dragRects,r);"
+        "if(region==='no-drag')addRect(noDragRects,r);"
+        "}"
         "for(const sel of selectors){"
         "for(const el of document.querySelectorAll(sel)){"
         "if(!el||seen.has(el))continue;"
@@ -569,11 +586,16 @@ static void on_load_end(void* user_data, int http_status_code) {
         "}"
         "const payload=JSON.stringify(normalizeRects(rects));"
         "if(payload!==last){last=payload;console.log('NEKO_INPUT_REGION:'+payload);}"
+        "const dragPayload=JSON.stringify(normalizeRects(dragRects));"
+        "if(dragPayload!==lastDrag){lastDrag=dragPayload;console.log('NEKO_DRAG_REGION:'+dragPayload);}"
+        "const noDragPayload=JSON.stringify(normalizeRects(noDragRects));"
+        "if(noDragPayload!==lastNoDrag){lastNoDrag=noDragPayload;console.log('NEKO_DRAG_EXCLUSION_REGION:'+noDragPayload);}"
         "}"
         "function schedule(){"
         "if(scheduled)return;"
         "scheduled=true;"
-        "requestAnimationFrame(collect);"
+        "if(timer)clearTimeout(timer);"
+        "timer=setTimeout(function(){timer=0;requestAnimationFrame(collect);},50);"
         "}"
         "window.addEventListener('resize',schedule,{passive:true});"
         "window.addEventListener('load',schedule,{passive:true});"
@@ -583,7 +605,7 @@ static void on_load_end(void* user_data, int http_status_code) {
         "window.addEventListener('live2d-agent-popup-opening',schedule,{passive:true});"
         "window.addEventListener('live2d-agent-popup-closed',schedule,{passive:true});"
         "new MutationObserver(schedule).observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['style','class','hidden']});"
-        "setInterval(schedule,1000);"
+        "setInterval(schedule,1500);"
         "setTimeout(schedule,0);"
         "setTimeout(schedule,300);"
         "setTimeout(schedule,1000);"
@@ -616,6 +638,18 @@ static void on_console(void* user_data,
     char details[3072];
     snprintf(details, sizeof(details), "rects=%s", message + 18);
     emit_event("input_region", details);
+    return;
+  }
+  if (message && strncmp(message, "NEKO_DRAG_REGION:", 17) == 0) {
+    char details[3072];
+    snprintf(details, sizeof(details), "rects=%s", message + 17);
+    emit_event("drag_region", details);
+    return;
+  }
+  if (message && strncmp(message, "NEKO_DRAG_EXCLUSION_REGION:", 27) == 0) {
+    char details[3072];
+    snprintf(details, sizeof(details), "rects=%s", message + 27);
+    emit_event("drag_exclusion_region", details);
     return;
   }
   if (!env_flag_enabled("NEKO_CEF_VERBOSE_CONSOLE")) {

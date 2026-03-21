@@ -47,6 +47,12 @@ pub enum CStandaloneHelperEvent {
     InputRegion {
         rects: Vec<InteractiveRectPayload>,
     },
+    DragRegion {
+        rects: Vec<InteractiveRectPayload>,
+    },
+    DragExclusionRegion {
+        rects: Vec<InteractiveRectPayload>,
+    },
     BrowserBeforeClose,
     BrowserReleased,
     ShutdownOk,
@@ -453,6 +459,16 @@ fn parse_event_line(payload: &str) -> Option<CStandaloneHelperEvent> {
                 .unwrap_or_default(),
         },
         "input_region" => CStandaloneHelperEvent::InputRegion {
+            rects: field_value(&fields, "rects")
+                .and_then(|value| from_str::<Vec<InteractiveRectPayload>>(value).ok())
+                .unwrap_or_default(),
+        },
+        "drag_region" => CStandaloneHelperEvent::DragRegion {
+            rects: field_value(&fields, "rects")
+                .and_then(|value| from_str::<Vec<InteractiveRectPayload>>(value).ok())
+                .unwrap_or_default(),
+        },
+        "drag_exclusion_region" => CStandaloneHelperEvent::DragExclusionRegion {
             rects: field_value(&fields, "rects")
                 .and_then(|value| from_str::<Vec<InteractiveRectPayload>>(value).ok())
                 .unwrap_or_default(),

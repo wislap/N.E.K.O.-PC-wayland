@@ -18,8 +18,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rfd::FileDialog;
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use tao::monitor::MonitorHandle;
 use tao::dpi::PhysicalPosition;
-use tao::window::{Window, WindowBuilder};
+use tao::window::{Fullscreen, Window, WindowBuilder};
 #[cfg(target_os = "linux")]
 use wry::WebViewBuilderExtUnix;
 use wry::{NewWindowResponse, WebView, WebViewBuilder};
@@ -78,6 +79,13 @@ fn helper_loop_sleep_ms(frame_rate: u32) -> u32 {
 fn helper_event_wait_ms(frame_rate: u32) -> u64 {
     let frame_rate = frame_rate.max(1);
     u64::from((1000 / frame_rate).clamp(1, 8))
+}
+
+fn input_region_apply_interval_ms() -> u64 {
+    std::env::var("NEKO_INPUT_REGION_MIN_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(80)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -314,6 +322,32 @@ fn collect_screen_info(window: &Window) -> HostEvent {
     }
 }
 
+fn find_display_for_point(window: &Window, screen_x: i32, screen_y: i32) -> Option<DisplaySnapshot> {
+    window
+        .available_monitors()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let position = monitor.position();
+            let size = monitor.size();
+            DisplaySnapshot {
+                id: format!("display-{index}"),
+                name: monitor.name(),
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+                scale_factor: monitor.scale_factor(),
+                is_current: false,
+            }
+        })
+        .find(|display| {
+            screen_x >= display.x
+                && screen_x < display.x + display.width as i32
+                && screen_y >= display.y
+                && screen_y < display.y + display.height as i32
+        })
+}
+
 fn collect_window_state(window: &Window) -> HostEvent {
     let position = window.outer_position().unwrap_or(tao::dpi::PhysicalPosition::new(0, 0));
     let size = window.outer_size();
@@ -331,6 +365,74 @@ fn collect_window_state(window: &Window) -> HostEvent {
             focused: window.is_focused(),
         },
     }
+}
+
+fn monitor_matches_name(monitor: &MonitorHandle, expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.is_empty() {
+        return false;
+    }
+    monitor
+        .name()
+        .map(|name| {
+            let name = name.trim().to_ascii_lowercase();
+            name == expected || name.contains(&expected)
+        })
+        .unwrap_or(false)
+}
+
+fn describe_monitor(monitor: &MonitorHandle) -> String {
+    let name = monitor.name().unwrap_or_else(|| "<unnamed>".to_string());
+    let position = monitor.position();
+    let size = monitor.size();
+    format!(
+        "{} @ {}x{}+{},{}",
+        name, size.width, size.height, position.x, position.y
+    )
+}
+
+fn select_target_monitor(
+    event_loop: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
+    config: &AppConfig,
+) -> Option<MonitorHandle> {
+    let monitors = event_loop.available_monitors().collect::<Vec<_>>();
+    if monitors.is_empty() {
+        return None;
+    }
+
+    if let Some(index) = config.target_display_index {
+        if let Some(monitor) = monitors.get(index).cloned() {
+            eprintln!(
+                "selected target display by index {}: {}",
+                index,
+                describe_monitor(&monitor)
+            );
+            return Some(monitor);
+        }
+        eprintln!(
+            "requested display index {} is out of range; available displays={}",
+            index,
+            monitors.len()
+        );
+    }
+
+    if let Some(name) = config.target_display_name.as_deref() {
+        if let Some(monitor) = monitors
+            .iter()
+            .find(|monitor| monitor_matches_name(monitor, name))
+            .cloned()
+        {
+            eprintln!(
+                "selected target display by name {:?}: {}",
+                name,
+                describe_monitor(&monitor)
+            );
+            return Some(monitor);
+        }
+        eprintln!("requested display name {:?} was not found; falling back", name);
+    }
+
+    None
 }
 
 fn open_external_url(url: &str) -> Result<()> {
@@ -530,6 +632,7 @@ pub fn run(config: AppConfig) -> Result<()> {
     let first_window = create_window(
         &event_loop,
         &proxy,
+        &config,
         &config.app_title,
         &frontend_url,
     )?;
@@ -699,7 +802,11 @@ pub fn run(config: AppConfig) -> Result<()> {
                         }
                         HostRequest::MoveWindowToDisplay { screen_x, screen_y } => {
                             if let Some(window) = main_window {
-                                window.set_outer_position(PhysicalPosition::new(screen_x, screen_y));
+                                let target_position =
+                                    find_display_for_point(window, screen_x, screen_y)
+                                        .map(|display| PhysicalPosition::new(display.x, display.y))
+                                        .unwrap_or_else(|| PhysicalPosition::new(screen_x, screen_y));
+                                window.set_outer_position(target_position);
                                 Some(collect_window_state(window))
                             } else {
                                 Some(HostEvent::Error {
@@ -777,6 +884,7 @@ pub fn run(config: AppConfig) -> Result<()> {
                     match create_window(
                         event_loop_window_target,
                         &proxy,
+                        &config,
                         &config.app_title,
                         &url,
                     ) {
@@ -1271,6 +1379,9 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
     let mut key_modifiers = 0_u32;
     let mut last_frame_push_at = None::<Instant>;
     let mut last_frontend_input_region = None::<InputRegion>;
+    let mut last_frontend_input_region_applied_at = None::<Instant>;
+    let mut last_frontend_drag_region = None::<InputRegion>;
+    let mut last_frontend_drag_exclusion_region = None::<InputRegion>;
     let frame_push_interval = Duration::from_millis(
         (1000_u64 / u64::from(effective_render_fps.max(1))).max(1),
     );
@@ -1344,6 +1455,9 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 frame_push_interval,
                 &mut last_frame_push_at,
                 &mut last_frontend_input_region,
+                &mut last_frontend_input_region_applied_at,
+                &mut last_frontend_drag_region,
+                &mut last_frontend_drag_exclusion_region,
                 Some((&raw_host_handle, &frame_delivery)),
             )?;
         }
@@ -1358,6 +1472,9 @@ fn run_c_standalone_probe(config: &AppConfig) -> Result<()> {
                 frame_push_interval,
                 &mut last_frame_push_at,
                 &mut last_frontend_input_region,
+                &mut last_frontend_input_region_applied_at,
+                &mut last_frontend_drag_region,
+                &mut last_frontend_drag_exclusion_region,
                 Some((&raw_host_handle, &frame_delivery)),
             )?;
             let _ = raw_host_handle.shutdown();
@@ -1428,6 +1545,9 @@ fn drain_c_standalone_events(
     frame_push_interval: Duration,
     last_frame_push_at: &mut Option<Instant>,
     last_frontend_input_region: &mut Option<InputRegion>,
+    last_frontend_input_region_applied_at: &mut Option<Instant>,
+    last_frontend_drag_region: &mut Option<InputRegion>,
+    last_frontend_drag_exclusion_region: &mut Option<InputRegion>,
     frame_sink: Option<(&RawHostHandle, &FrameDelivery)>,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -1442,6 +1562,9 @@ fn drain_c_standalone_events(
                 frame_push_interval,
                 last_frame_push_at,
                 last_frontend_input_region,
+                last_frontend_input_region_applied_at,
+                last_frontend_drag_region,
+                last_frontend_drag_exclusion_region,
                 frame_sink,
             )?,
             None => break,
@@ -1459,6 +1582,9 @@ fn apply_c_standalone_event(
     frame_push_interval: Duration,
     last_frame_push_at: &mut Option<Instant>,
     last_frontend_input_region: &mut Option<InputRegion>,
+    last_frontend_input_region_applied_at: &mut Option<Instant>,
+    last_frontend_drag_region: &mut Option<InputRegion>,
+    last_frontend_drag_exclusion_region: &mut Option<InputRegion>,
     frame_sink: Option<(&RawHostHandle, &FrameDelivery)>,
 ) -> Result<()> {
     match event {
@@ -1540,16 +1666,61 @@ fn apply_c_standalone_event(
             if last_frontend_input_region.as_ref() == Some(&region) {
                 return Ok(());
             }
+            let now = Instant::now();
+            if last_frontend_input_region_applied_at
+                .as_ref()
+                .is_some_and(|last| {
+                    now.duration_since(*last)
+                        < Duration::from_millis(input_region_apply_interval_ms())
+                })
+            {
+                return Ok(());
+            }
             if let Some((raw_host, _)) = frame_sink {
                 if let Err(err) = raw_host.set_input_region(region.clone()) {
                     return Err(err).context("failed to push frontend input region into raw host");
                 } else {
                     *last_frontend_input_region = Some(region.clone());
+                    *last_frontend_input_region_applied_at = Some(now);
                     eprintln!(
                         "applied frontend input region to raw host: {} rect(s)",
                         region.rects().len()
                     );
                 }
+            }
+        }
+        CStandaloneHelperEvent::DragRegion { rects } => {
+            let region = InputRegion::from_rects(
+                rects
+                    .into_iter()
+                    .map(|rect: InteractiveRectPayload| rect.into())
+                    .collect(),
+            );
+            if last_frontend_drag_region.as_ref() == Some(&region) {
+                return Ok(());
+            }
+            if let Some((raw_host, _)) = frame_sink {
+                raw_host
+                    .set_drag_region(region.clone())
+                    .context("failed to push drag region into raw host")?;
+                *last_frontend_drag_region = Some(region);
+            }
+        }
+        CStandaloneHelperEvent::DragExclusionRegion { rects } => {
+            let region = InputRegion::from_rects(
+                rects
+                    .into_iter()
+                    .map(|rect: InteractiveRectPayload| rect.into())
+                    .collect(),
+            );
+            if last_frontend_drag_exclusion_region.as_ref() == Some(&region) {
+                return Ok(());
+            }
+            if let Some((raw_host, _)) = frame_sink {
+                raw_host
+                    .set_drag_exclusion_region(region.clone())
+                    .context("failed to push drag exclusion region into raw host")?;
+                *last_frontend_drag_exclusion_region = Some(region);
             }
         }
         CStandaloneHelperEvent::BrowserBeforeClose => {
@@ -1614,6 +1785,8 @@ fn build_raw_host_config(
     raw_host_config.width = config.window_width;
     raw_host_config.height = config.window_height;
     raw_host_config.fullscreen = config.fullscreen;
+    raw_host_config.target_output_index = config.target_display_index;
+    raw_host_config.target_output_name = config.target_display_name.clone();
     raw_host_config.input_region = if initial_region.is_empty() {
         raw_host_config.input_region.clone()
     } else {
@@ -1696,16 +1869,35 @@ fn make_ipc_handler(
 fn create_window(
     event_loop: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
     proxy: &EventLoopProxy<UserEvent>,
+    config: &AppConfig,
     app_title: &str,
     url: &str,
 ) -> Result<WindowEntry> {
-    let window = WindowBuilder::new()
+    let target_monitor = select_target_monitor(event_loop, config);
+    let mut builder = WindowBuilder::new()
         .with_title(app_title)
         .with_decorations(false)
         .with_resizable(true)
-        .with_transparent(true)
+        .with_transparent(true);
+    if let Some(monitor) = target_monitor.as_ref() {
+        builder = builder.with_position(monitor.position());
+        if config.fullscreen {
+            builder = builder.with_inner_size(monitor.size());
+        }
+    }
+    if config.fullscreen {
+        builder = builder.with_fullscreen(Some(Fullscreen::Borderless(target_monitor.clone())));
+    }
+
+    let window = builder
         .build(event_loop)
         .context("failed to create tao window")?;
+    if let Some(monitor) = target_monitor {
+        window.set_outer_position(monitor.position());
+        if config.fullscreen {
+            window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+        }
+    }
 
     let new_window_proxy = proxy.clone();
     let builder = WebViewBuilder::new()
