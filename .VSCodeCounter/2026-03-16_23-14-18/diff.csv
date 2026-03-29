@@ -1,9 +1,0 @@
-"filename", "language", "Rust", "C", "comment", "blank", "total"
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/app.rs", "Rust", 297, 0, 0, 18, 315
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/c_bridge.rs", "Rust", -22, 0, 0, -1, -23
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/c_standalone_helper_main.c", "C", 0, 173, 0, 10, 183
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/cef/render_handler.rs", "Rust", -21, 0, 0, -2, -23
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/config.rs", "Rust", 49, 0, 0, 5, 54
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/frame_bridge.rs", "Rust", 311, 0, 0, 31, 342
-"/mnt/k_disk/programe/N.E.K.O.-PC-wayland/src/wayland/raw_host.rs", "Rust", 407, 0, 0, 27, 434
-"Total", "-", 1021, 173, 0, 88, 1282

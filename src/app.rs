@@ -87,7 +87,7 @@ fn input_region_apply_interval_ms() -> u64 {
     std::env::var("NEKO_INPUT_REGION_MIN_INTERVAL_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(80)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2124,7 +2124,11 @@ fn apply_c_standalone_event(
         }
         CStandaloneHelperEvent::FrontendIpc { .. } => {}
         CStandaloneHelperEvent::RawLine { event, fields } => {
-            eprintln!("C standalone helper event: {event} fields={fields:?}");
+            if event == "input_region_stats" {
+                eprintln!("C standalone helper input-region stats: {fields:?}");
+            } else {
+                eprintln!("C standalone helper event: {event} fields={fields:?}");
+            }
         }
     }
     Ok(())
