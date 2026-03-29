@@ -179,14 +179,12 @@ Responsibilities:
 - normalize and diff updates
 - provide validation helpers
 
-### `wayland::engine`
+### `wayland::strategy`
 
 Responsibilities:
 
-- define engine traits
 - select strategy tier
-- provide a no-op prototype engine now
-- later provide native implementations
+- describe compositor-facing behavior choices in plain data
 
 ## Implementation phases
 
@@ -224,7 +222,7 @@ Responsibilities:
 
 ## Current recommendation
 
-Keep the current `tao + wry` host for bootstrapping and web rendering, but build a dedicated Wayland capability layer in parallel. The important architectural shift is:
+Keep the rendering path centered on CEF OSR plus the native Wayland host. The important architectural shift is:
 
 - browser layer renders UI
 - native Wayland layer owns window/input behavior
@@ -243,24 +241,19 @@ The repository now contains a `wayland::raw_host` module that proves the native 
 - separate visible-region and input-region handling inside the native host
 - runtime RGBA frame submission through the native host control handle
 
-For safety, the main `neko-pc-wayland` app still keeps the existing `tao + wry` frontend path by default.
-
-An opt-in development bridge is available:
-
-- set `NEKO_WAYLAND_ENABLE_RAW_HOST_COMPANION=1`
-- the main app will spawn a native Wayland companion host
-- frontend-driven input-region updates are mirrored into that native host
-
-This is the transitional step before replacing the Linux Wayland window host completely.
+The main `neko-pc-wayland` app now defaults to the native raw-host + CEF OSR route.
 
 The app now also supports an explicit host mode switch:
 
-- `NEKO_WAYLAND_HOST_MODE=legacy`
-  Keeps the current `tao + wry` path only.
-
-- `NEKO_WAYLAND_HOST_MODE=companion`
-  Starts the current `tao + wry` frontend and mirrors input-region updates into the native Wayland host.
-
 - `NEKO_WAYLAND_HOST_MODE=raw_only`
-  Starts the native Wayland host directly from the main app entry, without creating the `tao + wry` window.
+  Starts the native Wayland host directly from the main app entry.
   If no explicit input region is provided yet, the app now falls back to a built-in debug region and visible debug background so the host is not mistaken for an empty transparent window.
+
+- `NEKO_WAYLAND_HOST_MODE=official_helper_probe`
+  Runs the official helper probing path.
+
+- `NEKO_WAYLAND_HOST_MODE=official_helper_run`
+  Runs the official helper runtime path.
+
+- `NEKO_WAYLAND_HOST_MODE=c_standalone_probe`
+  Runs the standalone helper probe path.

@@ -9,7 +9,7 @@ This project is the first Rust host skeleton for Linux Wayland. It intentionally
 - discovers the sibling `N.E.K.O` repo
 - starts `launcher.py`
 - parses `NEKO_EVENT` messages to resolve the real runtime ports
-- opens the resolved frontend URL in a native Linux webview window
+- opens the resolved frontend URL through the experimental CEF OSR + raw Wayland host pipeline
 - injects a minimal host/frontend IPC bridge as `window.NekoHost`
 - keeps the Wayland strategy/input-region design scaffold for future native window work
 
@@ -28,34 +28,63 @@ This Rust host is the first step toward a better architecture:
 ## Requirements
 
 - Rust toolchain
-- `webkit2gtk-4.1` development package
-- `gtk4`
+- local Linux CEF SDK/runtime via `NEKO_CEF_SDK_DIR`
 - `N.E.K.O` repository available locally
 - `uv` recommended, or a working `python3`
-
-This machine already has:
-
-- `webkit2gtk-4.1 = 2.50.4`
-- `gtk4 = 4.20.3`
 
 ## Running
 
 From this directory:
 
 ```bash
+export NEKO_CEF_SDK_DIR=/path/to/cef_binary_xxx_linux64
 cargo run
 ```
 
 Or run the explicit binary target:
 
 ```bash
+export NEKO_CEF_SDK_DIR=/path/to/cef_binary_xxx_linux64
 cargo run --bin neko-pc-wayland
 ```
 
 If repo auto-discovery fails:
 
 ```bash
-NEKO_REPO_ROOT=/path/to/N.E.K.O cargo run
+NEKO_CEF_SDK_DIR=/path/to/cef_binary_xxx_linux64 \
+NEKO_REPO_ROOT=/path/to/N.E.K.O \
+cargo run
+```
+
+## Runtime Config
+
+Primary environment variables:
+
+- `NEKO_CEF_SDK_DIR`: required CEF SDK/runtime root
+- `NEKO_REPO_ROOT`: optional explicit `N.E.K.O` repo path
+- `NEKO_WAYLAND_HOST_MODE`: optional host mode, one of `raw_only`, `official_helper_probe`, `official_helper_run`, `c_standalone_probe`
+- `NEKO_WAYLAND_FULLSCREEN`: enable fullscreen when set to `1`/`true`
+- `NEKO_WAYLAND_WINDOW_WIDTH` / `NEKO_WAYLAND_WINDOW_HEIGHT`: host window size
+- `NEKO_WAYLAND_RENDER_WIDTH` / `NEKO_WAYLAND_RENDER_HEIGHT`: frontend render size for CEF paths
+- `NEKO_WAYLAND_RENDER_FPS`: target render fps, clamped by CEF limits
+- `NEKO_WAYLAND_TRANSPARENT_BACKGROUND`: toggle transparent rendering
+- `NEKO_WAYLAND_DISPLAY_ID` / `NEKO_WAYLAND_DISPLAY_INDEX` / `NEKO_WAYLAND_DISPLAY_NAME`: select target output
+- `NEKO_WAYLAND_DEBUG_INPUT_REGION`: inject a debug input region
+- `NEKO_WAYLAND_TRACE_INPUT_REGION`: verbose input-region logging
+
+Default mode:
+
+```bash
+export NEKO_CEF_SDK_DIR=/path/to/cef_binary_xxx_linux64
+cargo run
+```
+
+Standalone helper probe example:
+
+```bash
+export NEKO_CEF_SDK_DIR=/path/to/cef_binary_xxx_linux64
+export NEKO_WAYLAND_HOST_MODE=c_standalone_probe
+cargo run
 ```
 
 ## IPC bridge

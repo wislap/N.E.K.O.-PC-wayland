@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::wayland::detect::WaylandProfile;
-use crate::wayland::engine::StrategySelection;
+use crate::wayland::strategy::StrategySelection;
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
 
 #[derive(Debug, Clone, Serialize)]

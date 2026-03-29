@@ -4,7 +4,7 @@ use anyhow::Context;
 
 #[cfg(feature = "cef_osr")]
 use neko_pc_wayland::cef::{
-    CefCBridge, CefCBridgeConfig, CefCBridgeRuntime, CefLifecycleEvent, clear_event_callback,
+    CefCBridgeConfig, CefCBridgeRuntime, CefLifecycleEvent, clear_event_callback,
     install_event_callback, run_raw_input_loop_cbridge, try_run_c_subprocess,
 };
 #[cfg(feature = "cef_osr")]

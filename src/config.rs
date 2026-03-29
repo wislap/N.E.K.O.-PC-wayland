@@ -7,8 +7,6 @@ use crate::wayland::input_region::{InputRegion, InteractiveRect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandHostMode {
-    Legacy,
-    Companion,
     RawOnly,
     OfficialHelperProbe,
     OfficialHelperRun,
@@ -235,28 +233,17 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn parse_wayland_host_mode() -> Result<WaylandHostMode> {
-    if env_flag("NEKO_WAYLAND_ENABLE_RAW_HOST_COMPANION") {
-        return Ok(WaylandHostMode::Companion);
-    }
-
     let Some(raw) = env::var_os("NEKO_WAYLAND_HOST_MODE") else {
-        return Ok(WaylandHostMode::Legacy);
+        return Ok(WaylandHostMode::RawOnly);
     };
 
     match raw.to_string_lossy().trim().to_ascii_lowercase().as_str() {
-        "" | "legacy" | "default" | "tao" | "wry" => Ok(WaylandHostMode::Legacy),
-        "companion" | "mirror" => Ok(WaylandHostMode::Companion),
-        "raw_only" | "raw-only" | "raw" => Ok(WaylandHostMode::RawOnly),
-        "official_helper_probe" | "official-helper-probe" | "helper_probe" => {
-            Ok(WaylandHostMode::OfficialHelperProbe)
-        }
-        "official_helper_run" | "official-helper-run" | "helper_run" | "official_helper"
-        | "official-helper" => Ok(WaylandHostMode::OfficialHelperRun),
-        "c_standalone_probe" | "c-standalone-probe" | "c_helper_probe" | "c-helper-probe" => {
-            Ok(WaylandHostMode::CStandaloneProbe)
-        }
+        "" | "default" | "raw_only" | "raw-only" | "raw" => Ok(WaylandHostMode::RawOnly),
+        "official_helper_probe" => Ok(WaylandHostMode::OfficialHelperProbe),
+        "official_helper_run" => Ok(WaylandHostMode::OfficialHelperRun),
+        "c_standalone_probe" => Ok(WaylandHostMode::CStandaloneProbe),
         other => bail!(
-            "invalid NEKO_WAYLAND_HOST_MODE value {:?}, expected legacy|companion|raw_only|official_helper_probe|official_helper_run|c_standalone_probe",
+            "invalid NEKO_WAYLAND_HOST_MODE value {:?}, expected default|raw_only|official_helper_probe|official_helper_run|c_standalone_probe",
             other
         ),
     }

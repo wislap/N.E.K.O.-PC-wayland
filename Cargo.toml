@@ -4,28 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["cef_osr"]
 cef_osr = []
 
 [dependencies]
 anyhow = "1.0.100"
 arboard = "3.6.1"
 base64 = "0.22.1"
-cairo-rs = "0.18.5"
 ctrlc = "3.5.0"
 env_logger = "0.11.8"
-gdk = "0.18.2"
-gdkwayland-sys = "0.18.2"
-gtk = "0.18.2"
 libc = "0.2.183"
 rfd = "0.15.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 smithay-client-toolkit = "0.20.0"
-tao = "0.30.8"
 wayland-client = "0.31.13"
 wayland-protocols = { version = "0.32.11", features = ["client"] }
-wry = { version = "0.53.5", features = ["transparent"] }
 xkeysym = "0.2.1"
 
 [build-dependencies]
