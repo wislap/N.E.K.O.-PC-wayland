@@ -145,7 +145,7 @@ pub enum RawHostKeyboardEvent {
 pub struct RawHostFrame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
+    pub bgra: Arc<[u8]>,
 }
 
 impl RawHostFrame {
@@ -164,7 +164,7 @@ impl RawHostFrame {
         Ok(Self {
             width,
             height,
-            bgra,
+            bgra: bgra.into(),
         })
     }
 
@@ -1150,12 +1150,13 @@ impl RawHostApp {
         let mut frame = self.runtime.shared_frame.take().unwrap_or(RawHostFrame {
             width,
             height,
-            bgra: Vec::new(),
+            bgra: Arc::from([]),
         });
-        let (loaded_width, loaded_height) =
-            reader.load_latest_into(&mut frame.bgra, width, height)?;
+        let mut bgra = frame.bgra.as_ref().to_vec();
+        let (loaded_width, loaded_height) = reader.load_latest_into(&mut bgra, width, height)?;
         frame.width = loaded_width;
         frame.height = loaded_height;
+        frame.bgra = bgra.into();
         self.runtime.shared_frame = Some(frame);
         self.runtime.frame = None;
         let result = self.draw();
@@ -1432,6 +1433,11 @@ fn blit_viewport_fullscreen_rgba_to_argb(
         return;
     }
 
+    if dst_width == viewport.width && dst_height == viewport.height {
+        blit_viewport_copy_rgba_to_argb(canvas, dst_width, frame, viewport);
+        return;
+    }
+
     for dst_y in 0..dst_height as usize {
         let src_y = viewport.y.max(0) as u32
             + ((dst_y as u64 * viewport.height as u64) / dst_height as u64) as u32;
@@ -1446,6 +1452,33 @@ fn blit_viewport_fullscreen_rgba_to_argb(
             let dst_base = dst_x * 4;
             dst_row[dst_base..dst_base + 4].copy_from_slice(&frame.bgra[src_base..src_base + 4]);
         }
+    }
+}
+
+fn blit_viewport_copy_rgba_to_argb(
+    canvas: &mut [u8],
+    dst_width: u32,
+    frame: &RawHostFrame,
+    viewport: &InteractiveRect,
+) {
+    let src_width = frame.width as usize;
+    let dst_stride = dst_width as usize * 4;
+    let src_x = viewport.x.max(0) as usize;
+    let src_y = viewport.y.max(0) as usize;
+    let copy_width = viewport.width.min(frame.width.saturating_sub(src_x as u32)) as usize;
+    let copy_height = viewport.height.min(frame.height.saturating_sub(src_y as u32)) as usize;
+    let copy_bytes = copy_width * 4;
+
+    if copy_width == 0 || copy_height == 0 {
+        canvas.fill(0);
+        return;
+    }
+
+    for row in 0..copy_height {
+        let src_base = ((src_y + row) * src_width + src_x) * 4;
+        let dst_base = row * dst_stride;
+        canvas[dst_base..dst_base + copy_bytes]
+            .copy_from_slice(&frame.bgra[src_base..src_base + copy_bytes]);
     }
 }
 

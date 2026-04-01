@@ -65,6 +65,8 @@ pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, mut sources: Vec<RawInput
         let mut progressed = false;
         let mut any_running = false;
 
+        bridge.do_message_loop_work();
+
         for (index, source) in sources.iter_mut().enumerate() {
             any_running |= source.handle.is_running();
 

@@ -748,7 +748,7 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
     cef_config.width = render_size.0;
     cef_config.height = render_size.1;
     cef_config.url = frontend_url;
-    cef_config.transparent_painting = false;
+    cef_config.transparent_painting = config.transparent_background;
     let effective_render_fps = clamp_cef_frame_rate(config.render_fps);
     if effective_render_fps != config.render_fps {
         eprintln!(
@@ -1826,12 +1826,10 @@ fn build_raw_cef_host_config(config: &AppConfig, install_ctrlc_handler: bool) ->
             width: raw_host_config.width,
             height: raw_host_config.height,
         }]);
-    raw_host_config.input_region = full_region.clone();
+    raw_host_config.input_region = current_input_region_or_empty(config);
     raw_host_config.visible_region = Some(full_region);
-    // Keep the host visibly present until the first CEF frame arrives; otherwise a stalled
-    // browser looks like an invisible window on every monitor.
-    raw_host_config.transparent_outside_input_region = false;
-    raw_host_config.show_debug_regions_when_empty = true;
+    raw_host_config.transparent_outside_input_region = config.transparent_background;
+    raw_host_config.show_debug_regions_when_empty = false;
     raw_host_config.move_on_left_press = false;
     raw_host_config
 }
