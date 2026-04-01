@@ -1826,9 +1826,19 @@ fn build_raw_cef_host_config(config: &AppConfig, install_ctrlc_handler: bool) ->
             width: raw_host_config.width,
             height: raw_host_config.height,
         }]);
-    raw_host_config.input_region = current_input_region_or_empty(config);
+    raw_host_config.input_region = if config
+        .debug_input_region
+        .as_ref()
+        .is_some_and(|region| !region.is_empty())
+    {
+        current_input_region_or_empty(config)
+    } else {
+        full_region.clone()
+    };
     raw_host_config.visible_region = Some(full_region);
     raw_host_config.transparent_outside_input_region = config.transparent_background;
+    raw_host_config.auto_input_region_from_frame_alpha =
+        config.transparent_background && config.debug_input_region.is_none();
     raw_host_config.show_debug_regions_when_empty = false;
     raw_host_config.move_on_left_press = false;
     raw_host_config

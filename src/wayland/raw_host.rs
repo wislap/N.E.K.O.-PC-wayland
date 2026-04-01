@@ -63,6 +63,7 @@ pub struct RawHostConfig {
     pub target_output_name: Option<String>,
     pub frame_viewport: Option<InteractiveRect>,
     pub input_region_source_size: Option<(u32, u32)>,
+    pub auto_input_region_from_frame_alpha: bool,
     pub input_region: InputRegion,
     pub drag_region: InputRegion,
     pub drag_exclusion_region: InputRegion,
@@ -205,6 +206,7 @@ impl RawHostConfig {
             target_output_name: None,
             frame_viewport: None,
             input_region_source_size: None,
+            auto_input_region_from_frame_alpha: false,
             input_region: InputRegion::from_rects(vec![InteractiveRect {
                 x: 0,
                 y: 0,
@@ -393,6 +395,7 @@ fn run_inner_with_running(
             target_output_name: config.target_output_name.clone(),
             frame_viewport: config.frame_viewport.clone(),
             input_region_source_size: config.input_region_source_size,
+            auto_input_region_from_frame_alpha: config.auto_input_region_from_frame_alpha,
             source_input_region: config.input_region.clone(),
             input_region: scale_input_region_to_window(
                 &config.input_region,
@@ -739,6 +742,7 @@ struct RawHostRuntime {
     target_output_name: Option<String>,
     frame_viewport: Option<InteractiveRect>,
     input_region_source_size: Option<(u32, u32)>,
+    auto_input_region_from_frame_alpha: bool,
     source_input_region: InputRegion,
     input_region: InputRegion,
     source_drag_region: InputRegion,
@@ -1124,6 +1128,7 @@ impl RawHostApp {
             if let Some(frame) = next_frame {
                 self.runtime.frame = Some(frame);
                 self.runtime.shared_frame = None;
+                self.update_auto_input_region_from_frame();
                 self.draw()?;
             }
 
@@ -1159,9 +1164,40 @@ impl RawHostApp {
         frame.bgra = bgra.into();
         self.runtime.shared_frame = Some(frame);
         self.runtime.frame = None;
+        self.update_auto_input_region_from_frame();
         let result = self.draw();
         self.frame_update_pending.store(false, Ordering::SeqCst);
         result
+    }
+
+    fn update_auto_input_region_from_frame(&mut self) {
+        if !self.runtime.auto_input_region_from_frame_alpha {
+            return;
+        }
+
+        let frame = self
+            .runtime
+            .frame
+            .as_ref()
+            .or(self.runtime.shared_frame.as_ref());
+        let Some(frame) = frame else {
+            return;
+        };
+
+        let derived = derive_input_region_from_frame_alpha(
+            frame,
+            self.runtime.frame_viewport.as_ref(),
+        );
+        if derived != self.runtime.source_input_region {
+            self.runtime.source_input_region = derived;
+            self.runtime.input_region = scale_input_region_to_window(
+                &self.runtime.source_input_region,
+                self.runtime.input_region_source_size,
+                self.runtime.width,
+                self.runtime.height,
+            );
+            self.runtime.input_region_applied = false;
+        }
     }
 
     fn apply_input_region(&mut self) -> Result<()> {
@@ -1408,6 +1444,116 @@ fn frame_viewport_or_full<'a>(
         width: frame.width,
         height: frame.height,
     })
+}
+
+fn derive_input_region_from_frame_alpha(
+    frame: &RawHostFrame,
+    viewport: Option<&InteractiveRect>,
+) -> InputRegion {
+    const TILE: u32 = 16;
+    const ALPHA_THRESHOLD: u8 = 16;
+
+    let viewport = frame_viewport_or_full(frame, viewport);
+    if viewport.width == 0 || viewport.height == 0 {
+        return InputRegion::default();
+    }
+
+    let src_left = viewport.x.max(0) as u32;
+    let src_top = viewport.y.max(0) as u32;
+    if src_left >= frame.width || src_top >= frame.height {
+        return InputRegion::default();
+    }
+
+    let src_width = viewport.width.min(frame.width.saturating_sub(src_left));
+    let src_height = viewport.height.min(frame.height.saturating_sub(src_top));
+    if src_width == 0 || src_height == 0 {
+        return InputRegion::default();
+    }
+
+    let tiles_x = src_width.div_ceil(TILE);
+    let tiles_y = src_height.div_ceil(TILE);
+    let mut rows: Vec<Vec<(u32, u32)>> = Vec::with_capacity(tiles_y as usize);
+
+    for tile_y in 0..tiles_y {
+        let y0 = src_top + tile_y * TILE;
+        let y1 = (y0 + TILE).min(src_top + src_height);
+        let mut spans = Vec::new();
+        let mut span_start = None::<u32>;
+
+        for tile_x in 0..tiles_x {
+            let x0 = src_left + tile_x * TILE;
+            let x1 = (x0 + TILE).min(src_left + src_width);
+            let interactive = tile_has_visible_alpha(frame, x0, y0, x1, y1, ALPHA_THRESHOLD);
+            if interactive {
+                span_start.get_or_insert(tile_x);
+            } else if let Some(start) = span_start.take() {
+                spans.push((start, tile_x));
+            }
+        }
+        if let Some(start) = span_start.take() {
+            spans.push((start, tiles_x));
+        }
+        rows.push(spans);
+    }
+
+    let mut rects = Vec::new();
+    let mut active: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for (row_index, spans) in rows.into_iter().enumerate() {
+        let tile_row = row_index as u32;
+        let mut next_active = Vec::new();
+
+        for (start, end) in spans {
+            if let Some(pos) = active
+                .iter()
+                .position(|(active_start, active_end, _, active_end_row)| {
+                    *active_start == start && *active_end == end && *active_end_row == tile_row
+                })
+            {
+                let mut rect = active.swap_remove(pos);
+                rect.3 = tile_row + 1;
+                next_active.push(rect);
+            } else {
+                next_active.push((start, end, tile_row, tile_row + 1));
+            }
+        }
+
+        rects.extend(active.into_iter().map(|(start, end, top, bottom)| InteractiveRect {
+            x: (start * TILE) as i32,
+            y: (top * TILE) as i32,
+            width: ((end - start) * TILE).min(src_width.saturating_sub(start * TILE)),
+            height: ((bottom - top) * TILE).min(src_height.saturating_sub(top * TILE)),
+        }));
+        active = next_active;
+    }
+
+    rects.extend(active.into_iter().map(|(start, end, top, bottom)| InteractiveRect {
+        x: (start * TILE) as i32,
+        y: (top * TILE) as i32,
+        width: ((end - start) * TILE).min(src_width.saturating_sub(start * TILE)),
+        height: ((bottom - top) * TILE).min(src_height.saturating_sub(top * TILE)),
+    }));
+
+    InputRegion::from_rects(rects)
+}
+
+fn tile_has_visible_alpha(
+    frame: &RawHostFrame,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    alpha_threshold: u8,
+) -> bool {
+    let frame_width = frame.width as usize;
+    for y in y0 as usize..y1 as usize {
+        let row = &frame.bgra[y * frame_width * 4..(y + 1) * frame_width * 4];
+        for x in x0 as usize..x1 as usize {
+            if row[x * 4 + 3] >= alpha_threshold {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn viewport_covers_full_frame(frame: &RawHostFrame, viewport: &InteractiveRect) -> bool {
