@@ -71,15 +71,15 @@ impl AppConfig {
 }
 
 fn default_render_width() -> u32 {
-    if parse_fullscreen_flag() { 1280 } else { 800 }
+    if parse_fullscreen_flag() { 1920 } else { 800 }
 }
 
 fn default_render_height() -> u32 {
-    if parse_fullscreen_flag() { 720 } else { 600 }
+    if parse_fullscreen_flag() { 1080 } else { 600 }
 }
 
 fn default_render_fps() -> u32 {
-    if parse_fullscreen_flag() { 24 } else { 30 }
+    if parse_fullscreen_flag() { 60 } else { 30 }
 }
 
 fn parse_dimension(name: &str, default: u32) -> Result<u32> {
@@ -122,7 +122,7 @@ fn parse_fullscreen_flag() -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         ),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 

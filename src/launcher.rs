@@ -1,6 +1,8 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -229,6 +231,13 @@ fn apply_process_group(command: &mut Command) {
 }
 
 pub fn wait_for_frontend_url(runtime: &LauncherRuntime) -> Result<PortSnapshot> {
+    wait_for_frontend_url_until(runtime, None)
+}
+
+pub fn wait_for_frontend_url_until(
+    runtime: &LauncherRuntime,
+    stop_requested: Option<&Arc<AtomicBool>>,
+) -> Result<PortSnapshot> {
     let mut ports = PortSnapshot::default();
     let mut backend_ready = false;
     let mut saw_startup_in_progress = false;
@@ -237,6 +246,10 @@ pub fn wait_for_frontend_url(runtime: &LauncherRuntime) -> Result<PortSnapshot> 
     let deadline = Instant::now() + Duration::from_secs(90);
 
     loop {
+        if stop_requested.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            bail!("startup interrupted by Ctrl+C");
+        }
+
         match runtime.receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(event) => {
                 if expected_launch_id.is_none() && event.event == "startup_begin" {

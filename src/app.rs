@@ -18,7 +18,7 @@ use rfd::FileDialog;
 #[cfg(feature = "cef_osr")]
 use crate::cef::{
     CefLifecycleEvent, CefOsrConfig, clear_event_callback, install_event_callback,
-    run_raw_input_loop, spawn_osr_bridge,
+    RawInputSource, run_multi_raw_input_loop, spawn_osr_bridge,
 };
 use crate::config::{AppConfig, WaylandHostMode};
 use crate::frame_bridge::{
@@ -32,14 +32,15 @@ use crate::ipc::{
 };
 use crate::launcher;
 use crate::official_helper::{OfficialHelperConfig, OfficialHelperHandle};
+use crate::shutdown::register_ctrlc_flag;
 use crate::standalone_helper::{
     CStandaloneHelperConfig, CStandaloneHelperEvent, CStandaloneHelperHandle,
 };
 use crate::wayland::detect::WaylandProfile;
 use crate::wayland::strategy::{StrategySelection, choose_strategy};
-use crate::wayland::input_region::InputRegion;
+use crate::wayland::input_region::{InputRegion, InteractiveRect};
 use crate::wayland::raw_host::{
-    RawHostConfig, RawHostDisplaySnapshot, RawHostHandle, spawn as spawn_raw_host,
+    RawHostConfig, RawHostDisplaySnapshot, RawHostHandle, RawHostThread, spawn as spawn_raw_host,
 };
 use crate::wayland::raw_host::RawHostPointerEvent;
 
@@ -264,6 +265,116 @@ fn display_snapshot_from_raw_host(display: RawHostDisplaySnapshot) -> DisplaySna
         scale_factor: display.scale_factor,
         is_current: display.is_current,
     }
+}
+
+#[derive(Debug, Clone)]
+struct MultiDisplayPlacement {
+    output_index: usize,
+    display: RawHostDisplaySnapshot,
+    viewport: InteractiveRect,
+}
+
+#[derive(Debug)]
+struct SpawnedRawHost {
+    thread: RawHostThread,
+    placement: MultiDisplayPlacement,
+}
+
+fn output_name_matches(display: &RawHostDisplaySnapshot, expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.is_empty() {
+        return false;
+    }
+    display
+        .name
+        .as_deref()
+        .map(|name| {
+            let name = name.trim().to_ascii_lowercase();
+            name == expected || name.contains(&expected)
+        })
+        .unwrap_or(false)
+}
+
+fn choose_primary_display_id(
+    config: &AppConfig,
+    displays: &[RawHostDisplaySnapshot],
+) -> Option<String> {
+    if let Some(id) = config.target_display_id.as_deref() {
+        if displays.iter().any(|display| display.id == id) {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(index) = config.target_display_index {
+        if let Some(display) = displays.get(index) {
+            return Some(display.id.clone());
+        }
+    }
+    if let Some(name) = config.target_display_name.as_deref() {
+        if let Some(display) = displays.iter().find(|display| output_name_matches(display, name)) {
+            return Some(display.id.clone());
+        }
+    }
+    displays.first().map(|display| display.id.clone())
+}
+
+fn build_multi_display_layout(
+    config: &AppConfig,
+    displays: &[RawHostDisplaySnapshot],
+) -> Option<(Vec<MultiDisplayPlacement>, String, (u32, u32))> {
+    if displays.is_empty() {
+        return None;
+    }
+
+    let min_x = displays.iter().map(|display| display.x).min()?;
+    let min_y = displays.iter().map(|display| display.y).min()?;
+    let max_x = displays
+        .iter()
+        .map(|display| display.x + display.width as i32)
+        .max()?;
+    let max_y = displays
+        .iter()
+        .map(|display| display.y + display.height as i32)
+        .max()?;
+    let render_width = (max_x - min_x).max(1) as u32;
+    let render_height = (max_y - min_y).max(1) as u32;
+
+    let primary_display_id = choose_primary_display_id(config, displays)?;
+    let mut placements = displays
+        .iter()
+        .enumerate()
+        .map(|(output_index, display)| MultiDisplayPlacement {
+            output_index,
+            viewport: InteractiveRect {
+                x: display.x - min_x,
+                y: display.y - min_y,
+                width: display.width,
+                height: display.height,
+            },
+            display: display.clone(),
+        })
+        .collect::<Vec<_>>();
+    placements.sort_by_key(|placement| {
+        (
+            placement.display.id != primary_display_id,
+            placement.display.x,
+            placement.display.y,
+        )
+    });
+    Some((placements, primary_display_id, (render_width, render_height)))
+}
+
+fn wait_for_raw_host_displays(handle: &RawHostHandle, timeout: Duration) -> Vec<RawHostDisplaySnapshot> {
+    let deadline = Instant::now() + timeout;
+    let mut last = Vec::new();
+    while Instant::now() < deadline {
+        let displays = handle.displays();
+        if !displays.is_empty() {
+            return displays;
+        }
+        last = displays;
+        thread::sleep(Duration::from_millis(50));
+    }
+    last
 }
 
 fn collect_raw_screen_info(raw_host: &RawHostHandle) -> HostEvent {
@@ -509,8 +620,24 @@ pub fn run(config: AppConfig) -> Result<()> {
 
 #[cfg(feature = "cef_osr")]
 fn run_raw_only_cef(config: AppConfig) -> Result<()> {
-    let launcher_runtime = launcher::start_launcher(&config.repo_root)?;
-    let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    register_ctrlc_flag(stop_requested.clone())?;
+
+    let mut launcher_runtime = Some(launcher::start_launcher(&config.repo_root)?);
+    let frontend_ports = match launcher::wait_for_frontend_url_until(
+        launcher_runtime
+            .as_ref()
+            .expect("launcher runtime should be available"),
+        Some(&stop_requested),
+    ) {
+        Ok(ports) => ports,
+        Err(err) => {
+            if let Some(mut runtime) = launcher_runtime.take() {
+                runtime.handle.terminate();
+            }
+            return Err(err);
+        }
+    };
     let frontend_url = frontend_ports
         .frontend_url()
         .context("launcher did not provide MAIN_SERVER_PORT")?;
@@ -522,19 +649,114 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
         ],
     );
     eprintln!("loading frontend url: {frontend_url}");
-
-    let raw_host = spawn_raw_host(build_raw_cef_host_config(&config, true))
-        .context("failed to spawn raw-only Wayland host")?;
-    let handle = raw_host.handle.clone();
-    let pointer_events = handle.subscribe_pointer_events();
-    let keyboard_events = handle.subscribe_keyboard_events();
+    let discovered_displays = discover_available_raw_displays(&config);
+    if discovered_displays.is_empty() {
+        eprintln!("raw display probe found no outputs; falling back to configured render size");
+    } else {
+        eprintln!("raw display probe found {} output(s):", discovered_displays.len());
+        for display in &discovered_displays {
+            eprintln!(
+                "  output id={} name={:?} origin=({}, {}) size={}x{} scale={}",
+                display.id,
+                display.name,
+                display.x,
+                display.y,
+                display.width,
+                display.height,
+                display.scale_factor
+            );
+        }
+    }
+    let multi_display = build_multi_display_layout(&config, &discovered_displays);
+    let (spawned_hosts, render_size) = if let Some((placements, primary_display_id, render_size)) =
+        multi_display
+    {
+        eprintln!(
+            "multi-display raw CEF layout: displays={} primary={} render={}x{}",
+            placements.len(),
+            primary_display_id,
+            render_size.0,
+            render_size.1
+        );
+        let mut hosts = Vec::with_capacity(placements.len());
+        for placement in placements {
+            let install_ctrlc_handler = placement.display.id == primary_display_id;
+            let thread = spawn_raw_host(build_raw_cef_host_config_for_display(
+                &config,
+                install_ctrlc_handler,
+                &placement,
+            ))
+            .with_context(|| {
+                format!(
+                    "failed to spawn raw Wayland host for display {}",
+                    placement.display.id
+                )
+            })?;
+            hosts.push(SpawnedRawHost { thread, placement });
+        }
+        (hosts, render_size)
+    } else {
+        let thread = spawn_raw_host(build_raw_cef_host_config(&config, true))
+            .context("failed to spawn raw-only Wayland host")?;
+        (
+            vec![SpawnedRawHost {
+                placement: MultiDisplayPlacement {
+                    viewport: InteractiveRect {
+                        x: 0,
+                        y: 0,
+                        width: config.render_width.max(1),
+                        height: config.render_height.max(1),
+                    },
+                    output_index: 0,
+                    display: RawHostDisplaySnapshot {
+                        id: "single-display".to_string(),
+                        name: Some("single-display".to_string()),
+                        x: 0,
+                        y: 0,
+                        width: config.window_width,
+                        height: config.window_height,
+                        scale_factor: 1.0,
+                        is_current: true,
+                    },
+                },
+                thread,
+            }],
+            (config.render_width.max(1), config.render_height.max(1)),
+        )
+    };
+    let primary_handle = spawned_hosts
+        .first()
+        .expect("at least one raw host should be available")
+        .thread
+        .handle
+        .clone();
+    let mut input_sources = Vec::with_capacity(spawned_hosts.len());
+    for host in &spawned_hosts {
+        let handle = host.thread.handle.clone();
+        input_sources.push(RawInputSource {
+            handle: handle.clone(),
+            pointer_events: handle.subscribe_pointer_events(),
+            keyboard_events: handle.subscribe_keyboard_events(),
+            viewport: host.placement.viewport.clone(),
+        });
+    }
+    for mirror in spawned_hosts.iter().skip(1) {
+        primary_handle.add_frame_mirror(mirror.thread.handle.clone());
+    }
 
     let mut cef_config = CefOsrConfig::demo();
-    cef_config.width = 800;
-    cef_config.height = 600;
+    cef_config.width = render_size.0;
+    cef_config.height = render_size.1;
     cef_config.url = frontend_url;
     cef_config.transparent_painting = false;
-    cef_config.frame_rate = clamp_cef_frame_rate(30);
+    let effective_render_fps = clamp_cef_frame_rate(config.render_fps);
+    if effective_render_fps != config.render_fps {
+        eprintln!(
+            "requested render fps {} is above CEF OSR limit; clamping to {}",
+            config.render_fps, effective_render_fps
+        );
+    }
+    cef_config.frame_rate = effective_render_fps;
 
     install_event_callback(|event| match event {
         CefLifecycleEvent::BrowserCreated => {
@@ -582,8 +804,7 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
         }
     });
 
-    let mut launcher_runtime = Some(launcher_runtime);
-    match spawn_osr_bridge(handle.clone(), cef_config) {
+    match spawn_osr_bridge(primary_handle.clone(), cef_config) {
         Ok(bridge) => {
             #[cfg(feature = "cef_osr")]
             let loop_mode = format!("{:?}", bridge.message_loop_mode());
@@ -598,24 +819,23 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
                 bridge.config().transparent_painting,
                 loop_mode
             );
-            run_raw_input_loop(&bridge, &handle, pointer_events, keyboard_events);
+            run_multi_raw_input_loop(&bridge, input_sources);
             bridge.request_close();
             clear_event_callback();
             if let Some(mut runtime) = launcher_runtime.take() {
                 runtime.handle.terminate();
             }
-            raw_host
-                .join()
-                .map_err(|_| anyhow::anyhow!("raw host thread panicked"))??;
+            shutdown_spawned_hosts(&spawned_hosts);
+            join_spawned_hosts(spawned_hosts)?;
             Ok(())
         }
         Err(err) => {
             clear_event_callback();
-            let _ = handle.shutdown();
+            shutdown_spawned_hosts(&spawned_hosts);
             if let Some(mut runtime) = launcher_runtime.take() {
                 runtime.handle.terminate();
             }
-            let _ = raw_host.join();
+            let _ = join_spawned_hosts(spawned_hosts);
             Err(err)
         }
     }
@@ -623,6 +843,31 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
 
 fn current_input_region_or_empty(config: &AppConfig) -> InputRegion {
     config.debug_input_region.clone().unwrap_or_default()
+}
+
+fn discover_available_raw_displays(config: &AppConfig) -> Vec<RawHostDisplaySnapshot> {
+    let Ok(probe_host) = spawn_raw_host(build_raw_display_probe_config(config)) else {
+        return Vec::new();
+    };
+    let displays = wait_for_raw_host_displays(&probe_host.handle, Duration::from_secs(1));
+    let _ = probe_host.handle.shutdown();
+    let _ = probe_host.join();
+    displays
+}
+
+fn shutdown_spawned_hosts(hosts: &[SpawnedRawHost]) {
+    for host in hosts {
+        let _ = host.thread.handle.shutdown();
+    }
+}
+
+fn join_spawned_hosts(hosts: Vec<SpawnedRawHost>) -> Result<()> {
+    for host in hosts {
+        host.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("raw host thread panicked"))??;
+    }
+    Ok(())
 }
 
 fn append_query_pairs(url: &str, pairs: &[(&str, &str)]) -> String {
@@ -1501,10 +1746,7 @@ fn apply_c_standalone_event(
 }
 
 fn install_shutdown_flag_handler(stop_requested: Arc<AtomicBool>) -> Result<()> {
-    ctrlc::set_handler(move || {
-        stop_requested.store(true, Ordering::Relaxed);
-    })
-    .context("failed to install Ctrl+C handler")
+    register_ctrlc_flag(stop_requested)
 }
 
 fn build_raw_host_config(
@@ -1552,13 +1794,31 @@ fn build_raw_host_config(
     raw_host_config
 }
 
+fn build_raw_display_probe_config(config: &AppConfig) -> RawHostConfig {
+    let mut raw_host_config = RawHostConfig::probe();
+    raw_host_config.title = format!("{} display-probe", config.app_title);
+    raw_host_config.app_id = "moe.neko.raw-wayland-display-probe".to_string();
+    raw_host_config.width = 1;
+    raw_host_config.height = 1;
+    raw_host_config.fullscreen = false;
+    raw_host_config.install_ctrlc_handler = false;
+    raw_host_config.log_pointer_events = false;
+    raw_host_config.input_region = InputRegion::default();
+    raw_host_config.visible_region = None;
+    raw_host_config.transparent_outside_input_region = true;
+    raw_host_config.show_debug_regions_when_empty = false;
+    raw_host_config.move_on_left_press = false;
+    raw_host_config
+}
+
 fn build_raw_cef_host_config(config: &AppConfig, install_ctrlc_handler: bool) -> RawHostConfig {
     let mut raw_host_config = build_raw_host_config(
         config,
         current_input_region_or_empty(config),
         install_ctrlc_handler,
     );
-    raw_host_config.input_region_source_size = Some((config.render_width, config.render_height));
+    raw_host_config.frame_viewport = None;
+    raw_host_config.input_region_source_size = Some((config.render_width.max(1), config.render_height.max(1)));
     let full_region =
         InputRegion::from_rects(vec![crate::wayland::input_region::InteractiveRect {
             x: 0,
@@ -1566,10 +1826,39 @@ fn build_raw_cef_host_config(config: &AppConfig, install_ctrlc_handler: bool) ->
             width: raw_host_config.width,
             height: raw_host_config.height,
         }]);
-    raw_host_config.input_region = current_input_region_or_empty(config);
+    raw_host_config.input_region = full_region.clone();
     raw_host_config.visible_region = Some(full_region);
-    raw_host_config.transparent_outside_input_region = true;
-    raw_host_config.show_debug_regions_when_empty = false;
+    // Keep the host visibly present until the first CEF frame arrives; otherwise a stalled
+    // browser looks like an invisible window on every monitor.
+    raw_host_config.transparent_outside_input_region = false;
+    raw_host_config.show_debug_regions_when_empty = true;
     raw_host_config.move_on_left_press = false;
+    raw_host_config
+}
+
+fn build_raw_cef_host_config_for_display(
+    config: &AppConfig,
+    install_ctrlc_handler: bool,
+    placement: &MultiDisplayPlacement,
+) -> RawHostConfig {
+    let mut raw_host_config = build_raw_cef_host_config(config, install_ctrlc_handler);
+    raw_host_config.title = format!(
+        "{} [{}:{}]",
+        config.app_title,
+        placement.output_index,
+        placement
+            .display
+            .name
+            .clone()
+            .unwrap_or_else(|| placement.display.id.clone())
+    );
+    raw_host_config.target_output_id = None;
+    raw_host_config.target_output_index = Some(placement.output_index);
+    raw_host_config.target_output_name = None;
+    raw_host_config.fullscreen = true;
+    raw_host_config.width = placement.display.width.max(1);
+    raw_host_config.height = placement.display.height.max(1);
+    raw_host_config.frame_viewport = Some(placement.viewport.clone());
+    raw_host_config.input_region_source_size = Some((placement.viewport.width, placement.viewport.height));
     raw_host_config
 }

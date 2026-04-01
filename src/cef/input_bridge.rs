@@ -6,6 +6,7 @@ use std::time::Duration;
 use xkeysym::key;
 
 use crate::cef::{CefKeyEventKind, CefMouseButton, CefOsrBridge};
+use crate::wayland::input_region::InteractiveRect;
 use crate::wayland::raw_host::{
     RawHostHandle, RawHostKeyboardEvent, RawHostModifiers, RawHostPointerButton,
     RawHostPointerEvent,
@@ -23,12 +24,37 @@ fn input_trace_enabled() -> bool {
     })
 }
 
+pub struct RawInputSource {
+    pub handle: RawHostHandle,
+    pub pointer_events: Receiver<RawHostPointerEvent>,
+    pub keyboard_events: Receiver<RawHostKeyboardEvent>,
+    pub viewport: InteractiveRect,
+}
+
 pub fn run_raw_input_loop(
     bridge: &CefOsrBridge,
     handle: &RawHostHandle,
     pointer_events: Receiver<RawHostPointerEvent>,
     keyboard_events: Receiver<RawHostKeyboardEvent>,
 ) {
+    let (width, height) = bridge.render_size();
+    run_multi_raw_input_loop(
+        bridge,
+        vec![RawInputSource {
+            handle: handle.clone(),
+            pointer_events,
+            keyboard_events,
+            viewport: InteractiveRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        }],
+    );
+}
+
+pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, mut sources: Vec<RawInputSource>) {
     bridge.focus_browser(true);
     bridge.notify_resized();
     let mut mouse_modifiers = 0_u32;
@@ -37,37 +63,47 @@ pub fn run_raw_input_loop(
 
     loop {
         let mut progressed = false;
+        let mut any_running = false;
 
-        loop {
-            match pointer_events.try_recv() {
-                Ok(event) => {
-                    progressed = true;
-                    if input_trace_enabled() {
-                        eprintln!("CEF input pointer event: {event:?}");
+        for (index, source) in sources.iter_mut().enumerate() {
+            any_running |= source.handle.is_running();
+
+            loop {
+                match source.pointer_events.try_recv() {
+                    Ok(event) => {
+                        progressed = true;
+                        if input_trace_enabled() {
+                            eprintln!("CEF input pointer event[{index}]: {event:?}");
+                        }
+                        let event = scale_pointer_event_to_viewport(
+                            event,
+                            source.handle.surface_size(),
+                            &source.viewport,
+                        );
+                        forward_pointer_event(bridge, event, &mut mouse_modifiers, key_modifiers);
                     }
-                    forward_pointer_event(bridge, event, &mut mouse_modifiers, key_modifiers);
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+            }
+
+            loop {
+                match source.keyboard_events.try_recv() {
+                    Ok(event) => {
+                        progressed = true;
+                        if input_trace_enabled() {
+                            eprintln!("CEF input keyboard event[{index}]: {event:?}");
+                        }
+                        key_modifiers = current_key_modifier_flags(&event);
+                        forward_keyboard_event(bridge, event);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
             }
         }
 
-        loop {
-            match keyboard_events.try_recv() {
-                Ok(event) => {
-                    progressed = true;
-                    if input_trace_enabled() {
-                        eprintln!("CEF input keyboard event: {event:?}");
-                    }
-                    key_modifiers = current_key_modifier_flags(&event);
-                    forward_keyboard_event(bridge, event);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
-            }
-        }
-
-        if !handle.is_running() {
+        if !any_running {
             break;
         }
 
@@ -81,6 +117,58 @@ pub fn run_raw_input_loop(
         } else {
             idle = true;
         }
+    }
+}
+
+fn scale_pointer_event_to_viewport(
+    event: RawHostPointerEvent,
+    window_size: (u32, u32),
+    viewport: &InteractiveRect,
+) -> RawHostPointerEvent {
+    fn scale(value: f64, src: u32, origin: i32, extent: u32) -> f64 {
+        if src == 0 || extent == 0 {
+            return value + f64::from(origin);
+        }
+        f64::from(origin) + value * f64::from(extent) / f64::from(src)
+    }
+
+    let (window_width, window_height) = window_size;
+
+    match event {
+        RawHostPointerEvent::Enter { x, y } => RawHostPointerEvent::Enter {
+            x: scale(x, window_width, viewport.x, viewport.width),
+            y: scale(y, window_height, viewport.y, viewport.height),
+        },
+        RawHostPointerEvent::Leave { x, y } => RawHostPointerEvent::Leave {
+            x: scale(x, window_width, viewport.x, viewport.width),
+            y: scale(y, window_height, viewport.y, viewport.height),
+        },
+        RawHostPointerEvent::Motion { x, y } => RawHostPointerEvent::Motion {
+            x: scale(x, window_width, viewport.x, viewport.width),
+            y: scale(y, window_height, viewport.y, viewport.height),
+        },
+        RawHostPointerEvent::Button {
+            x,
+            y,
+            button,
+            pressed,
+        } => RawHostPointerEvent::Button {
+            x: scale(x, window_width, viewport.x, viewport.width),
+            y: scale(y, window_height, viewport.y, viewport.height),
+            button,
+            pressed,
+        },
+        RawHostPointerEvent::Wheel {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => RawHostPointerEvent::Wheel {
+            x: scale(x, window_width, viewport.x, viewport.width),
+            y: scale(y, window_height, viewport.y, viewport.height),
+            delta_x,
+            delta_y,
+        },
     }
 }
 

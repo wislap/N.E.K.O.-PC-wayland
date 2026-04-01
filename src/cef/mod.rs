@@ -210,7 +210,7 @@ pub fn try_run_subprocess() -> Result<Option<i32>> {
 }
 
 #[cfg(feature = "cef_osr")]
-pub use input_bridge::run_raw_input_loop;
+pub use input_bridge::{RawInputSource, run_multi_raw_input_loop, run_raw_input_loop};
 #[cfg(feature = "cef_osr")]
 pub use events::{CefLifecycleEvent, clear_event_callback, install_event_callback};
 #[cfg(feature = "cef_osr")]

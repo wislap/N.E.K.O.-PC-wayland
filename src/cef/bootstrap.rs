@@ -25,9 +25,9 @@ impl CefSdkLayout {
             return Ok(layout);
         }
 
-        let root = env::var_os("NEKO_CEF_SDK_DIR")
-            .map(PathBuf::from)
-            .context("NEKO_CEF_SDK_DIR is not set")?;
+        let root = discover_sdk_root().context(
+            "no local CEF SDK was discovered automatically; set NEKO_CEF_SDK_DIR to a directory containing include/ and Release/libcef.so",
+        )?;
         let sdk = Self::from_sdk_root(root)?;
         Self::materialize_runtime_layout(&sdk)
     }
@@ -204,6 +204,65 @@ impl CefSdkLayout {
             libcef_so: runtime_root.join("libcef.so"),
         })
     }
+}
+
+fn discover_sdk_root() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("NEKO_CEF_SDK_DIR") {
+        let candidate = PathBuf::from(value);
+        if looks_like_sdk_root(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        roots.push(cwd.clone());
+        if let Some(parent) = cwd.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(exe_root) = exe.parent() {
+            roots.push(exe_root.to_path_buf());
+            if let Some(parent) = exe_root.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    for root in roots {
+        if looks_like_sdk_root(&root) {
+            return Some(root);
+        }
+        if let Some(found) = scan_sdk_children(&root) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn scan_sdk_children(root: &PathBuf) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.contains("cef") {
+            continue;
+        }
+        if looks_like_sdk_root(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn looks_like_sdk_root(path: &PathBuf) -> bool {
+    path.join("include").is_dir() && path.join("Release/libcef.so").is_file()
 }
 
 fn materialize_locales_dir(sdk: &CefSdkLayout, destination: &PathBuf) -> Result<()> {

@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use crate::shutdown::register_ctrlc_running_flag;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
@@ -60,6 +61,7 @@ pub struct RawHostConfig {
     pub target_output_id: Option<String>,
     pub target_output_index: Option<usize>,
     pub target_output_name: Option<String>,
+    pub frame_viewport: Option<InteractiveRect>,
     pub input_region_source_size: Option<(u32, u32)>,
     pub input_region: InputRegion,
     pub drag_region: InputRegion,
@@ -201,6 +203,7 @@ impl RawHostConfig {
             target_output_id: None,
             target_output_index: None,
             target_output_name: None,
+            frame_viewport: None,
             input_region_source_size: None,
             input_region: InputRegion::from_rects(vec![InteractiveRect {
                 x: 0,
@@ -243,6 +246,7 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
     let frame_update_pending = Arc::new(AtomicBool::new(false));
     let pointer_subscribers = Arc::new(Mutex::new(Vec::new()));
     let keyboard_subscribers = Arc::new(Mutex::new(Vec::new()));
+    let frame_mirrors = Arc::new(Mutex::new(Vec::new()));
     let thread_running = Arc::clone(&running);
     let thread_surface_size = Arc::clone(&surface_size);
     let thread_shared_state = Arc::clone(&shared_state);
@@ -277,6 +281,7 @@ pub fn spawn(config: RawHostConfig) -> Result<RawHostThread> {
             frame_update_pending,
             pointer_subscribers,
             keyboard_subscribers,
+            frame_mirrors,
         },
         thread,
     })
@@ -366,10 +371,7 @@ fn run_inner_with_running(
 
     if config.install_ctrlc_handler {
         let ctrlc_flag = Arc::clone(&running);
-        ctrlc::set_handler(move || {
-            ctrlc_flag.store(false, Ordering::SeqCst);
-        })
-        .context("failed to install Ctrl-C handler")?;
+        register_ctrlc_running_flag(ctrlc_flag)?;
     }
 
     let mut app = RawHostApp {
@@ -389,6 +391,7 @@ fn run_inner_with_running(
             target_output_id: config.target_output_id.clone(),
             target_output_index: config.target_output_index,
             target_output_name: config.target_output_name.clone(),
+            frame_viewport: config.frame_viewport.clone(),
             input_region_source_size: config.input_region_source_size,
             source_input_region: config.input_region.clone(),
             input_region: scale_input_region_to_window(
@@ -511,6 +514,7 @@ pub struct RawHostHandle {
     frame_update_pending: Arc<AtomicBool>,
     pointer_subscribers: Arc<Mutex<Vec<Sender<RawHostPointerEvent>>>>,
     keyboard_subscribers: Arc<Mutex<Vec<Sender<RawHostKeyboardEvent>>>>,
+    frame_mirrors: Arc<Mutex<Vec<RawHostHandle>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -558,6 +562,13 @@ impl Default for RawHostWindowStateSnapshot {
 }
 
 impl RawHostHandle {
+    pub fn add_frame_mirror(&self, mirror: RawHostHandle) {
+        self.frame_mirrors
+            .lock()
+            .expect("raw host frame mirrors mutex poisoned")
+            .push(mirror);
+    }
+
     pub fn set_input_region(&self, region: InputRegion) -> Result<()> {
         self.sender
             .send(RawHostCommand::SetInputRegion(region))
@@ -609,7 +620,15 @@ impl RawHostHandle {
                 .latest_frame
                 .lock()
                 .expect("latest frame mutex poisoned");
-            *latest_frame = Some(frame);
+            *latest_frame = Some(frame.clone());
+        }
+        let mirrors = self
+            .frame_mirrors
+            .lock()
+            .expect("raw host frame mirrors mutex poisoned")
+            .clone();
+        for mirror in mirrors {
+            let _ = mirror.set_rgba_frame(frame.clone());
         }
         if !self.frame_update_pending.swap(true, Ordering::SeqCst) {
             self.sender
@@ -620,6 +639,14 @@ impl RawHostHandle {
     }
 
     pub fn clear_frame(&self) -> Result<()> {
+        let mirrors = self
+            .frame_mirrors
+            .lock()
+            .expect("raw host frame mirrors mutex poisoned")
+            .clone();
+        for mirror in mirrors {
+            let _ = mirror.clear_frame();
+        }
         self.sender
             .send(RawHostCommand::ClearFrame)
             .map_err(|err| anyhow!("failed to clear RGBA frame in raw host: {err}"))
@@ -710,6 +737,7 @@ struct RawHostRuntime {
     target_output_id: Option<String>,
     target_output_index: Option<usize>,
     target_output_name: Option<String>,
+    frame_viewport: Option<InteractiveRect>,
     input_region_source_size: Option<(u32, u32)>,
     source_input_region: InputRegion,
     input_region: InputRegion,
@@ -911,21 +939,37 @@ impl RawHostApp {
             return;
         }
 
+        let mut outputs_with_info = outputs
+            .iter()
+            .cloned()
+            .map(|output| {
+                let info = self.output_state.info(&output);
+                (output, info)
+            })
+            .collect::<Vec<_>>();
+        outputs_with_info.sort_by_key(|(_, info)| {
+            info.as_ref()
+                .map(|info| {
+                    let (x, y) = info.logical_position.unwrap_or(info.location);
+                    let name = info.name.clone().or_else(|| info.description.clone());
+                    (x, y, name)
+                })
+                .unwrap_or((i32::MAX, i32::MAX, None))
+        });
+
         let selected = if let Some(expected_id) = self.runtime.target_output_id.as_deref() {
-            outputs.iter().find_map(|output| {
-                let info = self.output_state.info(output);
+            outputs_with_info.iter().find_map(|(output, info)| {
                 info.as_ref()
                     .filter(|info| Self::output_id(info) == expected_id)
                     .map(|info| (output.clone(), Some(info.clone())))
             })
         } else if let Some(index) = self.runtime.target_output_index {
-            outputs
+            outputs_with_info
                 .get(index)
                 .cloned()
-                .map(|output| (output.clone(), self.output_state.info(&output)))
+                .map(|(output, info)| (output, info))
         } else if let Some(expected_name) = self.runtime.target_output_name.as_deref() {
-            outputs.iter().find_map(|output| {
-                let info = self.output_state.info(output);
+            outputs_with_info.iter().find_map(|(output, info)| {
                 info.as_ref()
                     .filter(|info| Self::output_matches_name(info, expected_name))
                     .map(|info| (output.clone(), Some(info.clone())))
@@ -946,8 +990,10 @@ impl RawHostApp {
             return;
         }
 
-        if (self.runtime.target_output_id.is_some() || self.runtime.target_output_name.is_some())
-            && outputs.iter().any(|output| self.output_state.info(output).is_none())
+        if (self.runtime.target_output_id.is_some()
+            || self.runtime.target_output_name.is_some()
+            || self.runtime.target_output_index.is_some())
+            && outputs_with_info.iter().any(|(_, info)| info.is_none())
         {
             return;
         }
@@ -1191,6 +1237,7 @@ impl RawHostApp {
             .visible_region
             .as_ref()
             .unwrap_or(&self.runtime.input_region);
+        let frame_viewport = self.runtime.frame_viewport.as_ref();
         let frame_ref = self
             .runtime
             .frame
@@ -1200,14 +1247,29 @@ impl RawHostApp {
         if let Some(frame) = frame_ref {
             if frame.width == draw_width
                 && frame.height == draw_height
+                && frame_viewport.is_none()
                 && region_covers_full_window(visible_region, width, height)
             {
                 blit_fullscreen_rgba_to_argb(canvas, frame);
             } else if region_covers_full_window(visible_region, width, height)
                 && draw_width == width
                 && draw_height == height
+                && frame_viewport.is_none()
             {
                 blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, frame);
+            } else if region_covers_full_window(visible_region, width, height) {
+                let viewport = frame_viewport_or_full(frame, frame_viewport);
+                if viewport_covers_full_frame(frame, &viewport) {
+                    blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, frame);
+                } else {
+                    blit_viewport_fullscreen_rgba_to_argb(
+                        canvas,
+                        draw_width,
+                        draw_height,
+                        frame,
+                        &viewport,
+                    );
+                }
             } else {
                 draw_frame_with_regions(
                     canvas,
@@ -1216,6 +1278,7 @@ impl RawHostApp {
                     frame,
                     visible_region,
                     self.runtime.transparent_outside_input_region,
+                    frame_viewport,
                 );
             }
         } else {
@@ -1258,9 +1321,14 @@ impl RawHostApp {
             return None;
         }
         if let Some(frame) = self.runtime.frame.as_ref() {
-            return Some((frame.width, frame.height));
+            let viewport = frame_viewport_or_full(frame, self.runtime.frame_viewport.as_ref());
+            return Some((viewport.width.max(1), viewport.height.max(1)));
         }
-        self.runtime.input_region_source_size
+        self.runtime
+            .frame_viewport
+            .as_ref()
+            .map(|viewport| (viewport.width.max(1), viewport.height.max(1)))
+            .or(self.runtime.input_region_source_size)
     }
 }
 
@@ -1329,8 +1397,56 @@ fn region_covers_full_window(region: &InputRegion, width: u32, height: u32) -> b
     )
 }
 
+fn frame_viewport_or_full<'a>(
+    frame: &'a RawHostFrame,
+    viewport: Option<&'a InteractiveRect>,
+) -> InteractiveRect {
+    viewport.cloned().unwrap_or(InteractiveRect {
+        x: 0,
+        y: 0,
+        width: frame.width,
+        height: frame.height,
+    })
+}
+
+fn viewport_covers_full_frame(frame: &RawHostFrame, viewport: &InteractiveRect) -> bool {
+    viewport.x == 0
+        && viewport.y == 0
+        && viewport.width == frame.width
+        && viewport.height == frame.height
+}
+
 fn blit_fullscreen_rgba_to_argb(canvas: &mut [u8], frame: &RawHostFrame) {
     canvas.copy_from_slice(&frame.bgra);
+}
+
+fn blit_viewport_fullscreen_rgba_to_argb(
+    canvas: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    frame: &RawHostFrame,
+    viewport: &InteractiveRect,
+) {
+    if dst_width == 0 || dst_height == 0 || viewport.width == 0 || viewport.height == 0 {
+        canvas.fill(0);
+        return;
+    }
+
+    for dst_y in 0..dst_height as usize {
+        let src_y = viewport.y.max(0) as u32
+            + ((dst_y as u64 * viewport.height as u64) / dst_height as u64) as u32;
+        let src_y = src_y.min(frame.height.saturating_sub(1)) as usize;
+        let dst_row =
+            &mut canvas[dst_y * dst_width as usize * 4..(dst_y + 1) * dst_width as usize * 4];
+        for dst_x in 0..dst_width as usize {
+            let src_x = viewport.x.max(0) as u32
+                + ((dst_x as u64 * viewport.width as u64) / dst_width as u64) as u32;
+            let src_x = src_x.min(frame.width.saturating_sub(1)) as usize;
+            let src_base = (src_y * frame.width as usize + src_x) * 4;
+            let dst_base = dst_x * 4;
+            dst_row[dst_base..dst_base + 4].copy_from_slice(&frame.bgra[src_base..src_base + 4]);
+        }
+    }
 }
 
 fn blit_scaled_fullscreen_rgba_to_argb(
@@ -1373,10 +1489,11 @@ fn blit_scaled_fullscreen_rgba_to_argb(
 fn draw_frame_with_regions(
     canvas: &mut [u8],
     width: u32,
-    _height: u32,
+    height: u32,
     frame: &RawHostFrame,
     visible_region: &InputRegion,
     transparent_outside_input_region: bool,
+    frame_viewport: Option<&InteractiveRect>,
 ) {
     for (index, chunk) in canvas.chunks_exact_mut(4).enumerate() {
         let x = (index % width as usize) as i32;
@@ -1390,9 +1507,10 @@ fn draw_frame_with_regions(
             x,
             y,
             width,
-            _height,
+            height,
             visible,
             transparent_outside_input_region,
+            frame_viewport,
         );
         let array: &mut [u8; 4] = chunk.try_into().expect("chunk size must be 4");
         *array = color.to_le_bytes();
@@ -1455,6 +1573,7 @@ fn color_from_scaled_frame_or_background(
     dst_height: u32,
     visible: bool,
     transparent_outside_input_region: bool,
+    frame_viewport: Option<&InteractiveRect>,
 ) -> u32 {
     if !visible {
         return if transparent_outside_input_region {
@@ -1468,8 +1587,16 @@ fn color_from_scaled_frame_or_background(
         return argb(0x00, 0x00, 0x00, 0x00);
     }
 
-    let src_x = ((x as u32).saturating_mul(frame.width) / dst_width).min(frame.width.saturating_sub(1));
-    let src_y = ((y as u32).saturating_mul(frame.height) / dst_height).min(frame.height.saturating_sub(1));
+    let viewport = frame_viewport_or_full(frame, frame_viewport);
+    if viewport.width == 0 || viewport.height == 0 {
+        return argb(0x00, 0x00, 0x00, 0x00);
+    }
+    let src_x = (viewport.x.max(0) as u32
+        + ((x as u32).saturating_mul(viewport.width) / dst_width))
+        .min(frame.width.saturating_sub(1));
+    let src_y = (viewport.y.max(0) as u32
+        + ((y as u32).saturating_mul(viewport.height) / dst_height))
+        .min(frame.height.saturating_sub(1));
     let base = ((src_y * frame.width + src_x) * 4) as usize;
     let b = frame.bgra[base] as u32;
     let g = frame.bgra[base + 1] as u32;
