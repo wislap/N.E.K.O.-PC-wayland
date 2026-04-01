@@ -680,6 +680,20 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
         );
         let mut hosts = Vec::with_capacity(placements.len());
         for placement in placements {
+            eprintln!(
+                "  host placement: output_index={} target_id={} target_name={:?} display_origin=({}, {}) display_size={}x{} viewport=({}, {}) {}x{}",
+                placement.output_index,
+                placement.display.id,
+                placement.display.name,
+                placement.display.x,
+                placement.display.y,
+                placement.display.width,
+                placement.display.height,
+                placement.viewport.x,
+                placement.viewport.y,
+                placement.viewport.width,
+                placement.viewport.height
+            );
             let install_ctrlc_handler = placement.display.id == primary_display_id;
             let thread = spawn_raw_host(build_raw_cef_host_config_for_display(
                 &config,
@@ -1860,9 +1874,9 @@ fn build_raw_cef_host_config_for_display(
             .clone()
             .unwrap_or_else(|| placement.display.id.clone())
     );
-    raw_host_config.target_output_id = None;
+    raw_host_config.target_output_id = Some(placement.display.id.clone());
     raw_host_config.target_output_index = Some(placement.output_index);
-    raw_host_config.target_output_name = None;
+    raw_host_config.target_output_name = placement.display.name.clone();
     raw_host_config.fullscreen = true;
     raw_host_config.width = placement.display.width.max(1);
     raw_host_config.height = placement.display.height.max(1);

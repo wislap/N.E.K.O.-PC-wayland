@@ -960,29 +960,69 @@ impl RawHostApp {
                 })
                 .unwrap_or((i32::MAX, i32::MAX, None))
         });
+        let output_summary = outputs_with_info
+            .iter()
+            .map(|(_, info)| Self::describe_output(info.as_ref()))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "raw host fullscreen selection: requested id={:?} name={:?} index={:?} candidates={:?}",
+            self.runtime.target_output_id,
+            self.runtime.target_output_name,
+            self.runtime.target_output_index,
+            output_summary
+        );
 
-        let selected = if let Some(expected_id) = self.runtime.target_output_id.as_deref() {
-            outputs_with_info.iter().find_map(|(output, info)| {
-                info.as_ref()
-                    .filter(|info| Self::output_id(info) == expected_id)
-                    .map(|info| (output.clone(), Some(info.clone())))
+        if (self.runtime.target_output_id.is_some()
+            || self.runtime.target_output_name.is_some()
+            || self.runtime.target_output_index.is_some())
+            && outputs_with_info.iter().any(|(_, info)| info.is_none())
+        {
+            eprintln!(
+                "raw host fullscreen selection deferred: waiting for output metadata to resolve"
+            );
+            return;
+        }
+
+        let selected = self
+            .runtime
+            .target_output_id
+            .as_deref()
+            .and_then(|expected_id| {
+                outputs_with_info.iter().find_map(|(output, info)| {
+                    info.as_ref()
+                        .filter(|info| Self::output_id(info) == expected_id)
+                        .map(|info| (output.clone(), Some(info.clone())))
+                })
             })
-        } else if let Some(index) = self.runtime.target_output_index {
-            outputs_with_info
-                .get(index)
-                .cloned()
-                .map(|(output, info)| (output, info))
-        } else if let Some(expected_name) = self.runtime.target_output_name.as_deref() {
-            outputs_with_info.iter().find_map(|(output, info)| {
-                info.as_ref()
-                    .filter(|info| Self::output_matches_name(info, expected_name))
-                    .map(|info| (output.clone(), Some(info.clone())))
+            .or_else(|| {
+                self.runtime
+                    .target_output_name
+                    .as_deref()
+                    .and_then(|expected_name| {
+                        outputs_with_info.iter().find_map(|(output, info)| {
+                            info.as_ref()
+                                .filter(|info| Self::output_matches_name(info, expected_name))
+                                .map(|info| (output.clone(), Some(info.clone())))
+                        })
+                    })
             })
-        } else {
-            None
-        };
+            .or_else(|| {
+                self.runtime.target_output_index.and_then(|index| {
+                    outputs_with_info
+                        .get(index)
+                        .cloned()
+                        .map(|(output, info)| (output, info))
+                })
+            });
 
         if let Some((output, info)) = selected {
+            eprintln!(
+                "raw host fullscreen selection matched: requested id={:?} name={:?} index={:?} -> {}",
+                self.runtime.target_output_id,
+                self.runtime.target_output_name,
+                self.runtime.target_output_index,
+                Self::describe_output(info.as_ref())
+            );
             self.window.set_fullscreen(Some(&output));
             self.window.commit();
             self.runtime.fullscreen_output_applied = true;
@@ -991,14 +1031,6 @@ impl RawHostApp {
                 "raw host fullscreen target applied: {}",
                 Self::describe_output(info.as_ref())
             );
-            return;
-        }
-
-        if (self.runtime.target_output_id.is_some()
-            || self.runtime.target_output_name.is_some()
-            || self.runtime.target_output_index.is_some())
-            && outputs_with_info.iter().any(|(_, info)| info.is_none())
-        {
             return;
         }
 
