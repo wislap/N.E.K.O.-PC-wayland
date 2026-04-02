@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -62,13 +64,20 @@ pub fn run_raw_input_loop(
 }
 
 pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, sources: Vec<RawInputSource>) {
-    run_multi_raw_input_loop_with_tray_commands(bridge, sources, None, |_bridge, _command| {});
+    run_multi_raw_input_loop_with_tray_commands(
+        bridge,
+        sources,
+        None,
+        None,
+        |_bridge, _command| {},
+    );
 }
 
 pub fn run_multi_raw_input_loop_with_tray_commands(
     bridge: &CefOsrBridge,
     mut sources: Vec<RawInputSource>,
     tray_commands: Option<&Receiver<TrayCommand>>,
+    stop_requested: Option<&Arc<AtomicBool>>,
     mut on_tray_command: impl FnMut(&CefOsrBridge, TrayCommand),
 ) {
     bridge.focus_browser(true);
@@ -79,6 +88,10 @@ pub fn run_multi_raw_input_loop_with_tray_commands(
     let idle_sleep = idle_pump_sleep(bridge.config().frame_rate);
 
     loop {
+        if stop_requested.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            break;
+        }
+
         let mut progressed = false;
         let mut any_running = false;
 

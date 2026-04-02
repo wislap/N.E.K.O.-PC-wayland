@@ -903,6 +903,7 @@ fn run_raw_only_cef(
                 &bridge,
                 input_sources,
                 tray_commands.as_ref(),
+                Some(&stop_requested),
                 |bridge: &crate::cef::CefOsrBridge, command| match command {
                     TrayCommand::ReloadFrontend => {
                         bridge.execute_javascript(

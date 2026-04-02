@@ -1,4 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -24,9 +26,21 @@ pub fn register_ctrlc_running_flag(flag: Arc<AtomicBool>) -> Result<()> {
 
 fn register_ctrlc_flag_value(flag: Arc<AtomicBool>, value: bool) -> Result<()> {
     static HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
+    #[cfg(unix)]
+    static SIGINT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     if HANDLER_INSTALLED.get().is_none() {
         ctrlc::set_handler(|| {
+            #[cfg(unix)]
+            {
+                let count = SIGINT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                if count >= 2 {
+                    unsafe {
+                        libc::_exit(130);
+                    }
+                }
+            }
+
             let flags = shutdown_flags()
                 .lock()
                 .expect("shutdown flags mutex poisoned");

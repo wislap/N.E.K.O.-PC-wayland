@@ -36,18 +36,67 @@ impl LauncherHandle {
                 libc::killpg(pid, libc::SIGTERM);
             }
 
-            match self.child.wait() {
-                Ok(status) if status.success() || status.signal().is_some() => return,
-                Ok(_) | Err(_) => unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                },
+            let deadline = Instant::now() + Duration::from_millis(1200);
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(status)) if status.success() || status.signal().is_some() => return,
+                    Ok(Some(_)) => break,
+                    Ok(None) => thread::sleep(Duration::from_millis(25)),
+                    Err(_) => break,
+                }
+            }
+
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(20)),
+                    Err(_) => return,
+                }
             }
         }
 
         #[cfg(not(unix))]
-        let _ = self.child.kill();
+        {
+            let _ = self.child.kill();
+            let deadline = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(20)),
+                    Err(_) => return,
+                }
+            }
+        }
 
-        let _ = self.child.wait();
+        #[cfg(unix)]
+        {
+            let pid = self.child.id() as i32;
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
+
+        let _ = self.child.try_wait().or_else(|_| {
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::killpg(self.child.id() as i32, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = self.child.kill();
+            }
+            Err(std::io::Error::other("launcher process did not exit before timeout"))
+        });
     }
 }
 
