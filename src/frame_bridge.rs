@@ -102,6 +102,7 @@ pub struct SharedFrameReader {
 }
 
 pub struct SharedFrameView<'a> {
+    pub frame: u32,
     pub width: u32,
     pub height: u32,
     pub bgra: &'a [u8],
@@ -285,6 +286,7 @@ impl SharedFrameReader {
                 )
             };
             return Ok(SharedFrameView {
+                frame: header.frame,
                 width: header.width,
                 height: header.height,
                 bgra,

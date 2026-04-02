@@ -448,6 +448,7 @@ fn run_inner_with_running(
             frame: None,
             shared_frame_reader: None,
             shared_frame_dimensions: None,
+            last_shared_frame_number: None,
             current_output_id: None,
             fullscreen_output_applied: false,
             input_region_applied: false,
@@ -781,6 +782,7 @@ struct RawHostRuntime {
     frame: Option<RawHostFrame>,
     shared_frame_reader: Option<SharedFrameReader>,
     shared_frame_dimensions: Option<(u32, u32)>,
+    last_shared_frame_number: Option<u32>,
     current_output_id: Option<String>,
     fullscreen_output_applied: bool,
     input_region_applied: bool,
@@ -1177,6 +1179,7 @@ impl RawHostApp {
                 }
                 self.runtime.frame = None;
                 self.runtime.shared_frame_dimensions = None;
+                self.runtime.last_shared_frame_number = None;
                 self.draw()?;
             }
             RawHostCommand::Shutdown => {
@@ -1201,6 +1204,7 @@ impl RawHostApp {
             if let Some(frame) = next_frame {
                 self.runtime.frame = Some(frame);
                 self.runtime.shared_frame_dimensions = None;
+                self.runtime.last_shared_frame_number = None;
                 self.update_auto_input_region_from_frame();
                 self.draw()?;
             }
@@ -1226,7 +1230,12 @@ impl RawHostApp {
         };
 
         let shared_view = reader.latest_view(width, height)?;
+        if self.runtime.last_shared_frame_number == Some(shared_view.frame) {
+            self.frame_update_pending.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
         self.runtime.shared_frame_dimensions = Some((shared_view.width, shared_view.height));
+        self.runtime.last_shared_frame_number = Some(shared_view.frame);
         self.runtime.frame = None;
         self.update_auto_input_region_from_frame();
         let result = self.draw();
@@ -1460,9 +1469,14 @@ impl RawHostApp {
             viewport.set_destination(width as i32, height as i32);
         }
 
-        self.window
-            .wl_surface()
-            .damage_buffer(0, 0, draw_width as i32, draw_height as i32);
+        damage_surface_for_visible_region(
+            self.window.wl_surface(),
+            visible_region,
+            draw_width,
+            draw_height,
+            width,
+            height,
+        );
         buffer
             .attach_to(self.window.wl_surface())
             .context("failed to attach buffer to wl_surface")?;
@@ -1559,6 +1573,75 @@ fn region_covers_full_window(region: &InputRegion, width: u32, height: u32) -> b
             height: rect_height,
         }] if *rect_width == width && *rect_height == height
     )
+}
+
+fn damage_surface_for_visible_region(
+    surface: &wl_surface::WlSurface,
+    visible_region: &InputRegion,
+    draw_width: u32,
+    draw_height: u32,
+    window_width: u32,
+    window_height: u32,
+) {
+    if draw_width == 0 || draw_height == 0 {
+        return;
+    }
+
+    if draw_width != window_width
+        || draw_height != window_height
+        || region_covers_full_window(visible_region, window_width, window_height)
+    {
+        surface.damage_buffer(0, 0, draw_width as i32, draw_height as i32);
+        return;
+    }
+
+    let mut damaged = false;
+    for rect in visible_region.rects() {
+        let Some(clipped) = clip_rect_to_bounds(rect, draw_width, draw_height) else {
+            continue;
+        };
+        surface.damage_buffer(
+            clipped.x,
+            clipped.y,
+            clipped.width as i32,
+            clipped.height as i32,
+        );
+        damaged = true;
+    }
+
+    if !damaged {
+        surface.damage_buffer(0, 0, draw_width as i32, draw_height as i32);
+    }
+}
+
+fn clip_rect_to_bounds(
+    rect: &InteractiveRect,
+    width: u32,
+    height: u32,
+) -> Option<InteractiveRect> {
+    let left = rect.x.max(0) as u32;
+    let top = rect.y.max(0) as u32;
+    let right = rect
+        .x
+        .saturating_add(rect.width as i32)
+        .min(width as i32)
+        .max(0) as u32;
+    let bottom = rect
+        .y
+        .saturating_add(rect.height as i32)
+        .min(height as i32)
+        .max(0) as u32;
+
+    if left >= right || top >= bottom {
+        return None;
+    }
+
+    Some(InteractiveRect {
+        x: left as i32,
+        y: top as i32,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn frame_viewport_or_full<'a>(
@@ -1809,25 +1892,67 @@ fn draw_frame_with_regions(
     transparent_outside_input_region: bool,
     frame_viewport: Option<&InteractiveRect>,
 ) {
-    for (index, chunk) in canvas.chunks_exact_mut(4).enumerate() {
-        let x = (index % width as usize) as i32;
-        let y = (index / width as usize) as i32;
-        let visible = visible_region
-            .rects()
-            .iter()
-            .any(|rect| point_in_rect(x, y, rect));
-        let color = color_from_scaled_frame_or_background(
-            frame,
-            x,
-            y,
+    let background = if transparent_outside_input_region {
+        argb(0x00, 0x00, 0x00, 0x00)
+    } else {
+        argb(0xFF, 0x72, 0x12, 0x12)
+    }
+    .to_le_bytes();
+    for chunk in canvas.chunks_exact_mut(4) {
+        let array: &mut [u8; 4] = chunk.try_into().expect("chunk size must be 4");
+        *array = background;
+    }
+
+    for rect in visible_region.rects() {
+        blit_visible_rect_from_frame(
+            canvas,
             width,
             height,
-            visible,
-            transparent_outside_input_region,
+            frame,
+            rect,
             frame_viewport,
         );
-        let array: &mut [u8; 4] = chunk.try_into().expect("chunk size must be 4");
-        *array = color.to_le_bytes();
+    }
+}
+
+fn blit_visible_rect_from_frame(
+    canvas: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    frame: &FrameView<'_>,
+    rect: &InteractiveRect,
+    frame_viewport: Option<&InteractiveRect>,
+) {
+    if dst_width == 0 || dst_height == 0 || frame.width == 0 || frame.height == 0 {
+        return;
+    }
+
+    let Some(clipped) = clip_rect_to_bounds(rect, dst_width, dst_height) else {
+        return;
+    };
+    let left = clipped.x as u32;
+    let top = clipped.y as u32;
+    let right = left + clipped.width;
+    let bottom = top + clipped.height;
+
+    let viewport = frame_viewport_or_full(frame, frame_viewport);
+    if viewport.width == 0 || viewport.height == 0 {
+        return;
+    }
+
+    for dst_y in top..bottom {
+        let src_y = (viewport.y.max(0) as u32
+            + (dst_y.saturating_mul(viewport.height) / dst_height))
+            .min(frame.height.saturating_sub(1)) as usize;
+        let dst_row_base = dst_y as usize * dst_width as usize * 4;
+        for dst_x in left..right {
+            let src_x = (viewport.x.max(0) as u32
+                + (dst_x.saturating_mul(viewport.width) / dst_width))
+                .min(frame.width.saturating_sub(1)) as usize;
+            let src_base = (src_y * frame.width as usize + src_x) * 4;
+            let dst_base = dst_row_base + dst_x as usize * 4;
+            canvas[dst_base..dst_base + 4].copy_from_slice(&frame.bgra[src_base..src_base + 4]);
+        }
     }
 }
 
@@ -1877,46 +2002,6 @@ fn map_pointer_button(button: u32) -> RawHostPointerButton {
 
 fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
-}
-
-fn color_from_scaled_frame_or_background(
-    frame: &FrameView<'_>,
-    x: i32,
-    y: i32,
-    dst_width: u32,
-    dst_height: u32,
-    visible: bool,
-    transparent_outside_input_region: bool,
-    frame_viewport: Option<&InteractiveRect>,
-) -> u32 {
-    if !visible {
-        return if transparent_outside_input_region {
-            argb(0x00, 0x00, 0x00, 0x00)
-        } else {
-            argb(0xFF, 0x72, 0x12, 0x12)
-        };
-    }
-
-    if x < 0 || y < 0 || dst_width == 0 || dst_height == 0 {
-        return argb(0x00, 0x00, 0x00, 0x00);
-    }
-
-    let viewport = frame_viewport_or_full(frame, frame_viewport);
-    if viewport.width == 0 || viewport.height == 0 {
-        return argb(0x00, 0x00, 0x00, 0x00);
-    }
-    let src_x = (viewport.x.max(0) as u32
-        + ((x as u32).saturating_mul(viewport.width) / dst_width))
-        .min(frame.width.saturating_sub(1));
-    let src_y = (viewport.y.max(0) as u32
-        + ((y as u32).saturating_mul(viewport.height) / dst_height))
-        .min(frame.height.saturating_sub(1));
-    let base = ((src_y * frame.width + src_x) * 4) as usize;
-    let b = frame.bgra[base] as u32;
-    let g = frame.bgra[base + 1] as u32;
-    let r = frame.bgra[base + 2] as u32;
-    let a = frame.bgra[base + 3] as u32;
-    argb(a, r, g, b)
 }
 
 impl CompositorHandler for RawHostApp {

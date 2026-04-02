@@ -67,12 +67,12 @@ fn clamp_cef_frame_rate(frame_rate: u32) -> u32 {
 
 fn helper_loop_sleep_ms(frame_rate: u32) -> u32 {
     let frame_rate = frame_rate.max(1);
-    (1000 / frame_rate).clamp(1, 8)
+    ((1000 / frame_rate) / 2).clamp(1, 4)
 }
 
 fn helper_event_wait_ms(frame_rate: u32) -> u64 {
     let frame_rate = frame_rate.max(1);
-    u64::from((1000 / frame_rate).clamp(1, 8))
+    u64::from(((1000 / frame_rate) / 2).clamp(1, 4))
 }
 
 fn input_region_apply_interval_ms() -> u64 {

@@ -14,7 +14,7 @@ use crate::wayland::raw_host::{
 
 fn idle_pump_sleep(frame_rate: u32) -> Duration {
     let frame_rate = frame_rate.max(1);
-    let millis = (1000 / frame_rate).clamp(1, 8);
+    let millis = ((1000 / frame_rate) / 2).clamp(1, 4);
     Duration::from_millis(u64::from(millis))
 }
 

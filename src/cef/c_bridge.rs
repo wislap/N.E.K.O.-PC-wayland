@@ -528,6 +528,7 @@ pub fn run_raw_input_loop_cbridge(
     bridge.notify_resized();
     let mut mouse_modifiers = 0_u32;
     let mut key_modifiers = 0_u32;
+    let idle_sleep = Duration::from_millis(u64::from(cbridge_idle_sleep_ms()));
 
     while handle.is_running() {
         let mut progressed = false;
@@ -560,9 +561,18 @@ pub fn run_raw_input_loop_cbridge(
         }
 
         if !progressed {
-            thread::sleep(Duration::from_millis(8));
+            thread::sleep(idle_sleep);
         }
     }
+}
+
+fn cbridge_idle_sleep_ms() -> u32 {
+    let frame_rate = std::env::var("NEKO_CEF_HELPER_FRAME_RATE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(120)
+        .max(1);
+    ((1000 / frame_rate) / 2).clamp(1, 4)
 }
 
 struct MainArgs {

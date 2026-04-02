@@ -182,6 +182,13 @@ static int env_int_or_default(const char* name, int default_value) {
   return (int)parsed;
 }
 
+static int helper_sleep_ms_for_frame_rate(int frame_rate) {
+  if (frame_rate <= 0) {
+    frame_rate = 120;
+  }
+  return ((1000 / frame_rate) / 2 < 1) ? 1 : (((1000 / frame_rate) / 2 > 4) ? 4 : ((1000 / frame_rate) / 2));
+}
+
 static size_t env_size_or_zero(const char* name) {
   const char* value = env_or_null(name);
   char* end = NULL;
@@ -1169,11 +1176,11 @@ static void on_paint(void* user_data,
             state->frame_dump_path[0] ? state->frame_dump_path : "<null>");
     fflush(stderr);
   }
-  maybe_dump_frame(state, buffer, width, height);
-  maybe_write_shared_frame(state, buffer, width, height);
   if (element_type != 0) {
     return;
   }
+  maybe_dump_frame(state, buffer, width, height);
+  maybe_write_shared_frame(state, buffer, width, height);
   emit_event("paint", details);
 }
 
@@ -1190,6 +1197,7 @@ int main(int argc, char** argv) {
   int code;
   int should_shutdown = 0;
   int loop_sleep_ms = 4;
+  int browser_frame_rate = 120;
 
   memset(&settings, 0, sizeof(settings));
   memset(&state, 0, sizeof(state));
@@ -1201,7 +1209,9 @@ int main(int argc, char** argv) {
   settings.locale = env_or_null("NEKO_CEF_LOCALE");
   settings.cache_path = env_or_null("NEKO_CEF_CACHE_PATH");
   settings.root_cache_path = env_or_null("NEKO_CEF_ROOT_CACHE_PATH");
-  loop_sleep_ms = env_int_or_default("NEKO_CEF_HELPER_LOOP_SLEEP_MS", 4);
+  browser_frame_rate = env_int_or_default("NEKO_CEF_HELPER_FRAME_RATE", 120);
+  loop_sleep_ms =
+      env_int_or_default("NEKO_CEF_HELPER_LOOP_SLEEP_MS", helper_sleep_ms_for_frame_rate(browser_frame_rate));
   state.shared_frame_fd = env_int_or_default("NEKO_CEF_SHARED_FRAME_FD", -1);
   state.shared_frame_map_len = env_size_or_zero("NEKO_CEF_SHARED_FRAME_SIZE");
   {
@@ -1282,7 +1292,7 @@ int main(int argc, char** argv) {
     browser_config.window_name = "neko-cef-standalone";
     browser_config.width = env_int_or_default("NEKO_CEF_HELPER_WIDTH", 1920);
     browser_config.height = env_int_or_default("NEKO_CEF_HELPER_HEIGHT", 1080);
-    browser_config.frame_rate = env_int_or_default("NEKO_CEF_HELPER_FRAME_RATE", 30);
+    browser_config.frame_rate = browser_frame_rate;
     browser_config.transparent_painting = env_flag_enabled("NEKO_CEF_HELPER_TRANSPARENT") ? 1 : 0;
 
     callbacks.on_after_created = on_after_created;
