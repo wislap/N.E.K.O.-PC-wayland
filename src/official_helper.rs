@@ -71,6 +71,7 @@ enum HelperEvent {
 enum HelperCommand {
     Ping { nonce: Option<String> },
     Navigate { url: String },
+    Activate,
     Shutdown,
 }
 
@@ -283,6 +284,10 @@ impl OfficialHelperHandle {
 
     pub fn send_navigate(&mut self, url: impl Into<String>) -> Result<()> {
         self.send_command(&HelperCommand::Navigate { url: url.into() })
+    }
+
+    pub fn send_activate(&mut self) -> Result<()> {
+        self.send_command(&HelperCommand::Activate)
     }
 
     pub fn recv_event_timeout(&self, timeout: Duration) -> Result<Option<HelperEventEnvelope>> {

@@ -1119,7 +1119,7 @@ fn run_official_helper_runtime(
                         }
                     }
                     Ok(TrayCommand::Activate) => {
-                        if let Err(err) = helper.send_navigate(frontend_url.clone()) {
+                        if let Err(err) = helper.send_activate() {
                             eprintln!("failed to activate official helper from system tray: {err:#}");
                         }
                     }

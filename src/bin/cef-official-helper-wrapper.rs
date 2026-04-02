@@ -57,6 +57,7 @@ enum HelperEvent<'a> {
 enum HelperCommand {
     Ping { nonce: Option<String> },
     Navigate { url: String },
+    Activate,
     Shutdown,
 }
 
@@ -216,6 +217,23 @@ fn run() -> Result<()> {
                         reason: "official helper sample only accepts initial URL at process launch",
                     });
                 }
+                Ok(HelperCommand::Activate) => {
+                    let (activated, detail) = attempt_activate_child(child_pid);
+                    emit(&HelperEvent::State {
+                        phase: if activated {
+                            "activate"
+                        } else {
+                            "activate_failed"
+                        },
+                        detail: &detail,
+                    });
+                    if !activated {
+                        emit(&HelperEvent::Unsupported {
+                            command: "activate",
+                            reason: "no supported compositor/window-manager activation command succeeded",
+                        });
+                    }
+                }
                 Ok(HelperCommand::Shutdown) => {
                     emit(&HelperEvent::State {
                         phase: "shutdown",
@@ -299,4 +317,80 @@ fn emit(event: &HelperEvent<'_>) {
 
 fn terminate_child(child: &mut Child) {
     let _ = child.kill();
+}
+
+fn attempt_activate_child(pid: u32) -> (bool, String) {
+    let pid_text = pid.to_string();
+
+    let sway_criteria = format!(r#"[pid="{pid_text}"] focus"#);
+    if run_activation_command("swaymsg", &[sway_criteria.as_str()]) {
+        return (
+            true,
+            format!("activated official helper window via swaymsg for pid={pid_text}"),
+        );
+    }
+
+    let hypr_target = format!("pid:{pid_text}");
+    if run_activation_command("hyprctl", &["dispatch", "focuswindow", hypr_target.as_str()]) {
+        return (
+            true,
+            format!("activated official helper window via hyprctl for pid={pid_text}"),
+        );
+    }
+
+    if let Some(window_id) = find_wmctrl_window_id(pid) {
+        if run_activation_command("wmctrl", &["-ia", window_id.as_str()]) {
+            return (
+                true,
+                format!(
+                    "activated official helper window via wmctrl for pid={} window={}",
+                    pid_text, window_id
+                ),
+            );
+        }
+    }
+
+    if run_activation_command("xdotool", &["search", "--pid", pid_text.as_str(), "windowactivate"]) {
+        return (
+            true,
+            format!("activated official helper window via xdotool for pid={pid_text}"),
+        );
+    }
+
+    (
+        false,
+        format!(
+            "failed to activate official helper pid={pid_text}; tried swaymsg, hyprctl, wmctrl, xdotool"
+        ),
+    )
+}
+
+fn run_activation_command(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn find_wmctrl_window_id(pid: u32) -> Option<String> {
+    let output = Command::new("wmctrl").arg("-lp").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let window_id = parts.next()?;
+        let _desktop = parts.next()?;
+        let window_pid = parts.next()?.parse::<u32>().ok()?;
+        if window_pid == pid {
+            Some(window_id.to_string())
+        } else {
+            None
+        }
+    })
 }
