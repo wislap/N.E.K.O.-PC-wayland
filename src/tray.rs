@@ -24,6 +24,10 @@ pub struct SystemTrayHandle {
 pub enum TrayCommand {
     ReloadFrontend,
     Activate,
+    ToggleVisibility,
+    SetDarkMode(bool),
+    SetStreamerMode(bool),
+    SetCompatibilityMode(bool),
 }
 
 impl SystemTrayHandle {
@@ -50,6 +54,10 @@ impl SystemTrayHandle {
     }
 
     pub fn join(mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = &self.handle {
+            handle.shutdown();
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -146,6 +154,11 @@ impl ksni::Tray for NekoTray {
 
         let texts = self.texts();
         let mut menu = Vec::new();
+        let raw_window_visible = self
+            .raw_host
+            .as_ref()
+            .map(|raw_host| raw_host.window_state().visible)
+            .unwrap_or(true);
 
         if let Some(raw_host) = self.raw_host.clone() {
             let displays = raw_host.displays();
@@ -197,6 +210,18 @@ impl ksni::Tray for NekoTray {
         }
 
         menu.extend([
+            StandardItem {
+                label: if raw_window_visible {
+                    texts.hide.to_string()
+                } else {
+                    texts.show.to_string()
+                },
+                activate: Box::new(|this: &mut NekoTray| {
+                    let _ = this.command_sender.send(TrayCommand::ToggleVisibility);
+                }),
+                ..Default::default()
+            }
+            .into(),
             CheckmarkItem {
                 label: texts.dark_mode.to_string(),
                 checked: self.dark_mode,
@@ -205,6 +230,7 @@ impl ksni::Tray for NekoTray {
                     if let Err(err) = desktop_config::persist_dark_mode(this.dark_mode) {
                         eprintln!("failed to persist dark mode from system tray: {err:#}");
                     }
+                    let _ = this.command_sender.send(TrayCommand::SetDarkMode(this.dark_mode));
                 }),
                 ..Default::default()
             }
@@ -217,6 +243,9 @@ impl ksni::Tray for NekoTray {
                     if let Err(err) = desktop_config::persist_streamer_mode(this.streamer_mode) {
                         eprintln!("failed to persist streamer mode from system tray: {err:#}");
                     }
+                    let _ = this
+                        .command_sender
+                        .send(TrayCommand::SetStreamerMode(this.streamer_mode));
                 }),
                 ..Default::default()
             }
@@ -233,6 +262,9 @@ impl ksni::Tray for NekoTray {
                             "failed to persist compatibility mode from system tray: {err:#}"
                         );
                     }
+                    let _ = this
+                        .command_sender
+                        .send(TrayCommand::SetCompatibilityMode(this.compatibility_mode));
                 }),
                 ..Default::default()
             }
@@ -329,6 +361,8 @@ fn load_tray_icon_pixmap() -> Vec<ksni::Icon> {
 struct TrayTexts {
     tooltip: &'static str,
     displays: &'static str,
+    show: &'static str,
+    hide: &'static str,
     dark_mode: &'static str,
     streamer_mode: &'static str,
     compatibility_mode: &'static str,
@@ -343,6 +377,8 @@ impl TrayTexts {
             "zh-CN" => Self {
                 tooltip: "系统托盘菜单",
                 displays: "显示器",
+                show: "显示窗口",
+                hide: "隐藏窗口",
                 dark_mode: "暗色模式",
                 streamer_mode: "窗口模式",
                 compatibility_mode: "兼容模式",
@@ -353,6 +389,8 @@ impl TrayTexts {
             "zh-TW" => Self {
                 tooltip: "系統托盤選單",
                 displays: "顯示器",
+                show: "顯示視窗",
+                hide: "隱藏視窗",
                 dark_mode: "深色模式",
                 streamer_mode: "視窗模式",
                 compatibility_mode: "相容模式",
@@ -363,6 +401,8 @@ impl TrayTexts {
             "ja" => Self {
                 tooltip: "システムトレイメニュー",
                 displays: "ディスプレイ",
+                show: "ウィンドウを表示",
+                hide: "ウィンドウを隠す",
                 dark_mode: "ダークモード",
                 streamer_mode: "ウィンドウモード",
                 compatibility_mode: "互換モード",
@@ -373,6 +413,8 @@ impl TrayTexts {
             "ko" => Self {
                 tooltip: "시스템 트레이 메뉴",
                 displays: "디스플레이",
+                show: "창 표시",
+                hide: "창 숨기기",
                 dark_mode: "다크 모드",
                 streamer_mode: "창 모드",
                 compatibility_mode: "호환 모드",
@@ -383,6 +425,8 @@ impl TrayTexts {
             "ru" => Self {
                 tooltip: "Меню в системном трее",
                 displays: "Мониторы",
+                show: "Показать окно",
+                hide: "Скрыть окно",
                 dark_mode: "Темная тема",
                 streamer_mode: "Оконный режим",
                 compatibility_mode: "Режим совместимости",
@@ -393,6 +437,8 @@ impl TrayTexts {
             _ => Self {
                 tooltip: "System tray menu",
                 displays: "Displays",
+                show: "Show Window",
+                hide: "Hide Window",
                 dark_mode: "Dark mode",
                 streamer_mode: "Window mode",
                 compatibility_mode: "Compatibility mode",

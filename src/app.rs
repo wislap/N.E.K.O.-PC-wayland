@@ -921,6 +921,37 @@ fn run_raw_only_cef(
                             1,
                         );
                     }
+                    TrayCommand::ToggleVisibility => {
+                        if primary_handle.window_state().visible {
+                            if let Err(err) = primary_handle.minimize_window() {
+                                eprintln!("failed to minimize raw host from system tray: {err:#}");
+                            }
+                        } else {
+                            if let Err(err) = primary_handle.request_activation() {
+                                eprintln!("failed to restore raw host from system tray: {err:#}");
+                            }
+                            bridge.execute_javascript(
+                                "try{window.focus();document.body&&document.body.focus&&document.body.focus();}catch(_err){}",
+                                "neko://tray-show",
+                                1,
+                            );
+                        }
+                    }
+                    TrayCommand::SetDarkMode(enabled) => {
+                        let script = format!(
+                            "try{{window.nekoDarkMode&&window.nekoDarkMode.set({});}}catch(_err){{}}",
+                            if enabled { "true" } else { "false" }
+                        );
+                        bridge.execute_javascript(&script, "neko://tray-dark-mode", 1);
+                    }
+                    TrayCommand::SetStreamerMode(_enabled)
+                    | TrayCommand::SetCompatibilityMode(_enabled) => {
+                        bridge.execute_javascript(
+                            "window.location.reload();",
+                            "neko://tray-mode-reload",
+                            1,
+                        );
+                    }
                 },
             );
             bridge.request_close();
@@ -1108,6 +1139,7 @@ fn run_official_helper_runtime(
     let mut shutdown_deadline = None;
     let mut exit_status = None;
     let tray_commands = tray_handle.take_receiver();
+    let mut helper_visible = true;
 
     loop {
         if let Some(receiver) = tray_commands.as_ref() {
@@ -1121,7 +1153,32 @@ fn run_official_helper_runtime(
                     Ok(TrayCommand::Activate) => {
                         if let Err(err) = helper.send_activate() {
                             eprintln!("failed to activate official helper from system tray: {err:#}");
+                        } else {
+                            helper_visible = true;
                         }
+                    }
+                    Ok(TrayCommand::ToggleVisibility) => {
+                        let result = if helper_visible {
+                            helper.send_hide()
+                        } else {
+                            helper.send_activate()
+                        };
+                        if let Err(err) = result {
+                            eprintln!("failed to toggle official helper visibility from system tray: {err:#}");
+                        } else {
+                            helper_visible = !helper_visible;
+                        }
+                    }
+                    Ok(TrayCommand::SetDarkMode(_enabled)) => {
+                        eprintln!(
+                            "official helper runtime does not support live dark-mode sync; setting persisted for next launch"
+                        );
+                    }
+                    Ok(TrayCommand::SetStreamerMode(_enabled))
+                    | Ok(TrayCommand::SetCompatibilityMode(_enabled)) => {
+                        eprintln!(
+                            "official helper runtime does not support live mode reload; setting persisted for next launch"
+                        );
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
@@ -1507,6 +1564,38 @@ fn run_c_standalone_probe(
                             "try{window.focus();document.body&&document.body.focus&&document.body.focus();}catch(_err){}",
                         ) {
                             eprintln!("failed to activate frontend from system tray: {err:#}");
+                        }
+                    }
+                    Ok(TrayCommand::ToggleVisibility) => {
+                        if raw_host_handle.window_state().visible {
+                            if let Err(err) = raw_host_handle.minimize_window() {
+                                eprintln!("failed to minimize raw host from system tray: {err:#}");
+                            }
+                        } else {
+                            if let Err(err) = raw_host_handle.request_activation() {
+                                eprintln!("failed to restore raw host from system tray: {err:#}");
+                            }
+                            if let Err(err) = helper.send_eval_script(
+                                "try{window.focus();document.body&&document.body.focus&&document.body.focus();}catch(_err){}",
+                            ) {
+                                eprintln!("failed to focus frontend from system tray: {err:#}");
+                            }
+                        }
+                    }
+                    Ok(TrayCommand::SetDarkMode(enabled)) => {
+                        dark_mode_enabled = enabled;
+                        let script = format!(
+                            "try{{window.nekoDarkMode&&window.nekoDarkMode.set({});}}catch(_err){{}}",
+                            if enabled { "true" } else { "false" }
+                        );
+                        if let Err(err) = helper.send_eval_script(&script) {
+                            eprintln!("failed to sync dark mode from system tray: {err:#}");
+                        }
+                    }
+                    Ok(TrayCommand::SetStreamerMode(_enabled))
+                    | Ok(TrayCommand::SetCompatibilityMode(_enabled)) => {
+                        if let Err(err) = helper.send_eval_script("window.location.reload();") {
+                            eprintln!("failed to reload frontend after tray mode toggle: {err:#}");
                         }
                     }
                     Err(TryRecvError::Empty) => break,

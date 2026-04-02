@@ -58,6 +58,7 @@ enum HelperCommand {
     Ping { nonce: Option<String> },
     Navigate { url: String },
     Activate,
+    Hide,
     Shutdown,
 }
 
@@ -234,6 +235,19 @@ fn run() -> Result<()> {
                         });
                     }
                 }
+                Ok(HelperCommand::Hide) => {
+                    let (hidden, detail) = attempt_hide_child(child_pid);
+                    emit(&HelperEvent::State {
+                        phase: if hidden { "hide" } else { "hide_failed" },
+                        detail: &detail,
+                    });
+                    if !hidden {
+                        emit(&HelperEvent::Unsupported {
+                            command: "hide",
+                            reason: "no supported compositor/window-manager hide command succeeded",
+                        });
+                    }
+                }
                 Ok(HelperCommand::Shutdown) => {
                     emit(&HelperEvent::State {
                         phase: "shutdown",
@@ -362,6 +376,34 @@ fn attempt_activate_child(pid: u32) -> (bool, String) {
         format!(
             "failed to activate official helper pid={pid_text}; tried swaymsg, hyprctl, wmctrl, xdotool"
         ),
+    )
+}
+
+fn attempt_hide_child(pid: u32) -> (bool, String) {
+    let pid_text = pid.to_string();
+
+    if let Some(window_id) = find_wmctrl_window_id(pid) {
+        if run_activation_command("wmctrl", &["-ir", window_id.as_str(), "-b", "add,hidden"]) {
+            return (
+                true,
+                format!(
+                    "hid official helper window via wmctrl for pid={} window={}",
+                    pid_text, window_id
+                ),
+            );
+        }
+    }
+
+    if run_activation_command("xdotool", &["search", "--pid", pid_text.as_str(), "windowminimize"]) {
+        return (
+            true,
+            format!("hid official helper window via xdotool for pid={pid_text}"),
+        );
+    }
+
+    (
+        false,
+        format!("failed to hide official helper pid={pid_text}; tried wmctrl and xdotool"),
     )
 }
 

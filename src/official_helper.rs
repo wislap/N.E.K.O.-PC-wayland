@@ -1,9 +1,11 @@
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -72,6 +74,7 @@ enum HelperCommand {
     Ping { nonce: Option<String> },
     Navigate { url: String },
     Activate,
+    Hide,
     Shutdown,
 }
 
@@ -290,6 +293,10 @@ impl OfficialHelperHandle {
         self.send_command(&HelperCommand::Activate)
     }
 
+    pub fn send_hide(&mut self) -> Result<()> {
+        self.send_command(&HelperCommand::Hide)
+    }
+
     pub fn recv_event_timeout(&self, timeout: Duration) -> Result<Option<HelperEventEnvelope>> {
         match self.events.recv_timeout(timeout) {
             Ok(event) => Ok(Some(HelperEventEnvelope { event })),
@@ -408,8 +415,52 @@ impl OfficialHelperHandle {
 
     pub fn terminate(&mut self) {
         let _ = self.send_shutdown();
+        self.stdin.take();
+
+        #[cfg(unix)]
+        {
+            let pid = self.child.id() as i32;
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+        }
+
         let _ = self.child.kill();
-        let _ = self.child.wait();
+
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    #[cfg(unix)]
+                    {
+                        if status.success() || status.signal().is_some() {
+                            return;
+                        }
+                    }
+
+                    #[cfg(not(unix))]
+                    {
+                        if status.success() {
+                            return;
+                        }
+                    }
+
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(_) => return,
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let pid = self.child.id() as i32;
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+
+        let _ = self.child.try_wait();
     }
 
     fn send_command(&mut self, command: &HelperCommand) -> Result<()> {

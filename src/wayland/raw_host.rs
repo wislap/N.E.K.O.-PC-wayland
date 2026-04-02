@@ -462,6 +462,7 @@ fn run_inner_with_running(
             move_on_left_press: config.move_on_left_press,
             log_pointer_events: config.log_pointer_events,
             activation_pending: false,
+            window_visible: true,
         },
         activation_state,
         buffer: None,
@@ -732,6 +733,12 @@ impl RawHostHandle {
             .map_err(|err| anyhow!("failed to request raw host activation: {err}"))
     }
 
+    pub fn minimize_window(&self) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::MinimizeWindow)
+            .map_err(|err| anyhow!("failed to request raw host minimization: {err}"))
+    }
+
     pub fn displays(&self) -> Vec<RawHostDisplaySnapshot> {
         self.shared_state
             .lock()
@@ -772,6 +779,7 @@ enum RawHostCommand {
     FrameReady,
     ClearFrame,
     RequestActivation,
+    MinimizeWindow,
     Shutdown,
 }
 
@@ -807,6 +815,7 @@ struct RawHostRuntime {
     move_on_left_press: bool,
     log_pointer_events: bool,
     activation_pending: bool,
+    window_visible: bool,
 }
 
 struct RawHostApp {
@@ -852,6 +861,8 @@ impl RawHostApp {
         };
 
         self.runtime.activation_pending = false;
+        self.runtime.window_visible = true;
+        self.sync_shared_state();
         activation_state.request_token(
             qh,
             RequestData {
@@ -930,7 +941,7 @@ impl RawHostApp {
                 .map(|display| display.scale_factor)
                 .unwrap_or(1.0),
             fullscreen: self.runtime.fullscreen,
-            visible: !self.exit && self.running.load(Ordering::SeqCst),
+            visible: self.runtime.window_visible && !self.exit && self.running.load(Ordering::SeqCst),
         };
 
         let mut shared_state = self
@@ -1227,6 +1238,14 @@ impl RawHostApp {
             }
             RawHostCommand::RequestActivation => {
                 self.runtime.activation_pending = true;
+                self.runtime.window_visible = true;
+                self.sync_shared_state();
+            }
+            RawHostCommand::MinimizeWindow => {
+                self.window.set_minimized();
+                self.window.commit();
+                self.runtime.window_visible = false;
+                self.sync_shared_state();
             }
             RawHostCommand::Shutdown => {
                 self.exit = true;
