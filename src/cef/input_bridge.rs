@@ -6,6 +6,7 @@ use std::time::Duration;
 use xkeysym::key;
 
 use crate::cef::{CefKeyEventKind, CefMouseButton, CefOsrBridge};
+use crate::tray::TrayCommand;
 use crate::wayland::input_region::InteractiveRect;
 use crate::wayland::raw_host::{
     RawHostHandle, RawHostKeyboardEvent, RawHostModifiers, RawHostPointerButton,
@@ -60,7 +61,16 @@ pub fn run_raw_input_loop(
     );
 }
 
-pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, mut sources: Vec<RawInputSource>) {
+pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, sources: Vec<RawInputSource>) {
+    run_multi_raw_input_loop_with_tray_commands(bridge, sources, None, |_bridge, _command| {});
+}
+
+pub fn run_multi_raw_input_loop_with_tray_commands(
+    bridge: &CefOsrBridge,
+    mut sources: Vec<RawInputSource>,
+    tray_commands: Option<&Receiver<TrayCommand>>,
+    mut on_tray_command: impl FnMut(&CefOsrBridge, TrayCommand),
+) {
     bridge.focus_browser(true);
     bridge.notify_resized();
     let mut mouse_modifiers = 0_u32;
@@ -73,6 +83,18 @@ pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, mut sources: Vec<RawInput
         let mut any_running = false;
 
         bridge.do_message_loop_work();
+        if let Some(receiver) = tray_commands {
+            loop {
+                match receiver.try_recv() {
+                    Ok(command) => {
+                        progressed = true;
+                        on_tray_command(bridge, command);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
 
         for (index, source) in sources.iter_mut().enumerate() {
             any_running |= source.handle.is_running();

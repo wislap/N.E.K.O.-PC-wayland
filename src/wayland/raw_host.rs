@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crate::shutdown::register_ctrlc_running_flag;
+use smithay_client_toolkit::activation::{ActivationHandler, ActivationState, RequestData};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
@@ -34,8 +35,9 @@ use smithay_client_toolkit::shm::{
     slot::{Buffer, SlotPool},
 };
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm, delegate_simple, delegate_xdg_shell, delegate_xdg_window,
+    delegate_activation, delegate_compositor, delegate_keyboard, delegate_output,
+    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_simple,
+    delegate_xdg_shell, delegate_xdg_window,
     registry_handlers,
 };
 use wayland_client::{
@@ -377,6 +379,7 @@ fn run_inner_with_running(
     let xdg_shell = XdgShell::bind(&globals, &qh).context("xdg_shell is not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm is not available")?;
     let viewporter = SimpleGlobal::<WpViewporter, 1>::bind(&globals, &qh).ok();
+    let activation_state = ActivationState::bind(&globals, &qh).ok();
 
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::None, &qh);
@@ -414,6 +417,7 @@ fn run_inner_with_running(
         viewporter,
         viewport,
         runtime: RawHostRuntime {
+            app_id: config.app_id.clone(),
             width: config.width,
             height: config.height,
             fullscreen: config.fullscreen,
@@ -457,7 +461,9 @@ fn run_inner_with_running(
             show_debug_regions_when_empty: config.show_debug_regions_when_empty,
             move_on_left_press: config.move_on_left_press,
             log_pointer_events: config.log_pointer_events,
+            activation_pending: false,
         },
+        activation_state,
         buffer: None,
         buffer_dimensions: None,
         first_configure: true,
@@ -508,6 +514,7 @@ fn run_inner_with_running(
     );
 
     while app.running.load(Ordering::SeqCst) && !app.exit {
+        app.process_pending_activation(&qh);
         event_loop
             .dispatch(Duration::from_millis(16), &mut app)
             .context("Wayland event loop dispatch failed")?;
@@ -719,6 +726,12 @@ impl RawHostHandle {
             .map_err(|err| anyhow!("failed to update raw host target output: {err}"))
     }
 
+    pub fn request_activation(&self) -> Result<()> {
+        self.sender
+            .send(RawHostCommand::RequestActivation)
+            .map_err(|err| anyhow!("failed to request raw host activation: {err}"))
+    }
+
     pub fn displays(&self) -> Vec<RawHostDisplaySnapshot> {
         self.shared_state
             .lock()
@@ -758,11 +771,13 @@ enum RawHostCommand {
     },
     FrameReady,
     ClearFrame,
+    RequestActivation,
     Shutdown,
 }
 
 #[derive(Debug)]
 struct RawHostRuntime {
+    app_id: String,
     width: u32,
     height: u32,
     fullscreen: bool,
@@ -791,6 +806,7 @@ struct RawHostRuntime {
     show_debug_regions_when_empty: bool,
     move_on_left_press: bool,
     log_pointer_events: bool,
+    activation_pending: bool,
 }
 
 struct RawHostApp {
@@ -801,6 +817,7 @@ struct RawHostApp {
     shm: Shm,
     pool: SlotPool,
     window: Window,
+    activation_state: Option<ActivationState>,
     viewporter: Option<SimpleGlobal<WpViewporter, 1>>,
     viewport: Option<WpViewport>,
     runtime: RawHostRuntime,
@@ -823,6 +840,32 @@ struct RawHostApp {
 }
 
 impl RawHostApp {
+    fn process_pending_activation(&mut self, qh: &QueueHandle<Self>) {
+        if !self.runtime.activation_pending {
+            return;
+        }
+
+        let Some(activation_state) = self.activation_state.as_ref() else {
+            eprintln!("raw host activation requested but xdg_activation_v1 is unavailable");
+            self.runtime.activation_pending = false;
+            return;
+        };
+
+        self.runtime.activation_pending = false;
+        activation_state.request_token(
+            qh,
+            RequestData {
+                app_id: Some(self.runtime.app_id.clone()),
+                seat_and_serial: None,
+                surface: Some(self.window.wl_surface().clone()),
+            },
+        );
+        eprintln!(
+            "raw host activation token requested for app_id={:?}",
+            self.runtime.app_id
+        );
+    }
+
     fn with_current_frame_view<T>(&self, f: impl FnOnce(FrameView<'_>) -> T) -> Option<T> {
         if let Some(frame) = self.runtime.frame.as_ref() {
             return Some(f(frame.as_view()));
@@ -1182,6 +1225,9 @@ impl RawHostApp {
                 self.runtime.last_shared_frame_number = None;
                 self.draw()?;
             }
+            RawHostCommand::RequestActivation => {
+                self.runtime.activation_pending = true;
+            }
             RawHostCommand::Shutdown => {
                 self.exit = true;
                 self.running.store(false, Ordering::SeqCst);
@@ -1507,6 +1553,19 @@ impl RawHostApp {
                 .map(|viewport| (viewport.width.max(1), viewport.height.max(1)))
                 .or(self.runtime.input_region_source_size)
         })
+    }
+}
+
+impl ActivationHandler for RawHostApp {
+    type RequestData = RequestData;
+
+    fn new_token(&mut self, token: String, _data: &Self::RequestData) {
+        let Some(activation_state) = self.activation_state.as_ref() else {
+            return;
+        };
+
+        eprintln!("raw host activation token received; requesting compositor activation");
+        activation_state.activate::<Self>(self.window.wl_surface(), token);
     }
 }
 
@@ -2543,5 +2602,6 @@ delegate_keyboard!(RawHostApp);
 delegate_pointer!(RawHostApp);
 delegate_xdg_shell!(RawHostApp);
 delegate_xdg_window!(RawHostApp);
+delegate_activation!(RawHostApp);
 delegate_simple!(RawHostApp, WpViewporter, 1);
 delegate_registry!(RawHostApp);

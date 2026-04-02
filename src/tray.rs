@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
+use std::{sync::mpsc, sync::Mutex};
 
 use anyhow::{Result, anyhow};
 
@@ -15,7 +16,14 @@ use crate::wayland::raw_host::RawHostHandle;
 pub struct SystemTrayHandle {
     #[cfg(target_os = "linux")]
     handle: Option<ksni::Handle<NekoTray>>,
+    receiver: Mutex<Option<mpsc::Receiver<TrayCommand>>>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayCommand {
+    ReloadFrontend,
+    Activate,
 }
 
 impl SystemTrayHandle {
@@ -23,8 +31,13 @@ impl SystemTrayHandle {
         Self {
             #[cfg(target_os = "linux")]
             handle: None,
+            receiver: Mutex::new(None),
             thread: None,
         }
+    }
+
+    pub fn take_receiver(&self) -> Option<mpsc::Receiver<TrayCommand>> {
+        self.receiver.lock().ok().and_then(|mut slot| slot.take())
     }
 
     pub fn attach_raw_host(&self, raw_host: RawHostHandle) {
@@ -48,8 +61,10 @@ pub fn spawn_system_tray(
     stop_requested: Arc<AtomicBool>,
     initial_dark_mode: bool,
 ) -> Result<SystemTrayHandle> {
+    let (sender, receiver) = mpsc::channel();
     let tray = NekoTray {
         stop_requested,
+        command_sender: sender,
         dark_mode: initial_dark_mode,
         raw_host: None,
         streamer_mode: load_streamer_mode(),
@@ -64,6 +79,7 @@ pub fn spawn_system_tray(
         .map_err(|err| anyhow!("failed to spawn system tray thread: {err}"))?;
     Ok(SystemTrayHandle {
         handle: Some(handle),
+        receiver: Mutex::new(Some(receiver)),
         thread: Some(thread),
     })
 }
@@ -79,6 +95,7 @@ pub fn spawn_system_tray(
 #[cfg(target_os = "linux")]
 struct NekoTray {
     stop_requested: Arc<AtomicBool>,
+    command_sender: mpsc::Sender<TrayCommand>,
     dark_mode: bool,
     raw_host: Option<RawHostHandle>,
     streamer_mode: bool,
@@ -121,8 +138,7 @@ impl ksni::Tray for NekoTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = restart_current_process();
-        self.stop_requested.store(true, Ordering::Relaxed);
+        let _ = self.command_sender.send(TrayCommand::Activate);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -224,8 +240,7 @@ impl ksni::Tray for NekoTray {
             StandardItem {
                 label: texts.reload.to_string(),
                 activate: Box::new(|this: &mut NekoTray| {
-                    let _ = restart_current_process();
-                    this.stop_requested.store(true, Ordering::Relaxed);
+                    let _ = this.command_sender.send(TrayCommand::ReloadFrontend);
                 }),
                 ..Default::default()
             }
@@ -253,17 +268,6 @@ impl ksni::Tray for NekoTray {
 
         menu
     }
-}
-
-#[cfg(target_os = "linux")]
-fn restart_current_process() -> Result<()> {
-    let exe = env::current_exe().map_err(|err| anyhow!("failed to resolve current exe: {err}"))?;
-    let args = env::args_os().skip(1).collect::<Vec<_>>();
-    Command::new(exe)
-        .args(args)
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| anyhow!("failed to restart process: {err}"))
 }
 
 #[cfg(target_os = "linux")]

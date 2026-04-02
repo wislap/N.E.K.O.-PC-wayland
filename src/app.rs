@@ -18,7 +18,7 @@ use rfd::FileDialog;
 #[cfg(feature = "cef_osr")]
 use crate::cef::{
     CefLifecycleEvent, CefOsrConfig, clear_event_callback, install_event_callback,
-    RawInputSource, run_multi_raw_input_loop, spawn_osr_bridge,
+    RawInputSource, run_multi_raw_input_loop_with_tray_commands, spawn_osr_bridge,
 };
 use crate::config::{AppConfig, WaylandHostMode};
 use crate::desktop_config;
@@ -38,7 +38,7 @@ use crate::shutdown::register_ctrlc_flag;
 use crate::standalone_helper::{
     CStandaloneHelperConfig, CStandaloneHelperEvent, CStandaloneHelperHandle,
 };
-use crate::tray;
+use crate::tray::{self, TrayCommand};
 use crate::wayland::detect::WaylandProfile;
 use crate::wayland::strategy::{StrategySelection, choose_strategy};
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
@@ -615,7 +615,7 @@ pub fn run(config: AppConfig) -> Result<()> {
             }
             WaylandHostMode::OfficialHelperRun => {
                 eprintln!("running in official helper runtime mode");
-                run_official_helper_runtime(&config, stop_requested.clone())
+                run_official_helper_runtime(&config, stop_requested.clone(), &tray_handle)
             }
             WaylandHostMode::CStandaloneProbe => {
                 eprintln!("running in C standalone helper probe mode");
@@ -796,6 +796,7 @@ fn run_raw_only_cef(
         .handle
         .clone();
     tray_handle.attach_raw_host(primary_handle.clone());
+    let tray_commands = tray_handle.take_receiver();
     let mut input_sources = Vec::with_capacity(spawned_hosts.len());
     for host in &spawned_hosts {
         let handle = host.thread.handle.clone();
@@ -898,7 +899,30 @@ fn run_raw_only_cef(
                 bridge.config().transparent_painting,
                 loop_mode
             );
-            run_multi_raw_input_loop(&bridge, input_sources);
+            run_multi_raw_input_loop_with_tray_commands(
+                &bridge,
+                input_sources,
+                tray_commands.as_ref(),
+                |bridge: &crate::cef::CefOsrBridge, command| match command {
+                    TrayCommand::ReloadFrontend => {
+                        bridge.execute_javascript(
+                            "window.location.reload();",
+                            "neko://tray-reload",
+                            1,
+                        );
+                    }
+                    TrayCommand::Activate => {
+                        if let Err(err) = primary_handle.request_activation() {
+                            eprintln!("failed to request raw host activation from system tray: {err:#}");
+                        }
+                        bridge.execute_javascript(
+                            "try{window.focus();document.body&&document.body.focus&&document.body.focus();}catch(_err){}",
+                            "neko://tray-activate",
+                            1,
+                        );
+                    }
+                },
+            );
             bridge.request_close();
             clear_event_callback();
             if let Some(mut runtime) = launcher_runtime.take() {
@@ -1040,6 +1064,7 @@ fn run_official_helper_probe(config: &AppConfig) -> Result<()> {
 fn run_official_helper_runtime(
     config: &AppConfig,
     stop_requested: Arc<AtomicBool>,
+    tray_handle: &tray::SystemTrayHandle,
 ) -> Result<()> {
     let launcher_runtime = launcher::start_launcher(config)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
@@ -1082,8 +1107,28 @@ fn run_official_helper_runtime(
     let mut shutdown_sent = false;
     let mut shutdown_deadline = None;
     let mut exit_status = None;
+    let tray_commands = tray_handle.take_receiver();
 
     loop {
+        if let Some(receiver) = tray_commands.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(TrayCommand::ReloadFrontend) => {
+                        if let Err(err) = helper.send_navigate(frontend_url.clone()) {
+                            eprintln!("failed to reload frontend from system tray: {err:#}");
+                        }
+                    }
+                    Ok(TrayCommand::Activate) => {
+                        if let Err(err) = helper.send_navigate(frontend_url.clone()) {
+                            eprintln!("failed to activate official helper from system tray: {err:#}");
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
         if stop_requested.load(Ordering::Relaxed) && !shutdown_sent {
             eprintln!("shutdown requested, forwarding graceful stop to official helper");
             if let Err(err) = helper.send_shutdown() {
@@ -1443,8 +1488,33 @@ fn run_c_standalone_probe(
     let frontend_language_script = build_language_sync_script()?;
     let mut last_raw_screen_script = None::<String>;
     let mut last_raw_window_script = None::<String>;
+    let tray_commands = tray_handle.take_receiver();
 
     loop {
+        if let Some(receiver) = tray_commands.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(TrayCommand::ReloadFrontend) => {
+                        if let Err(err) = helper.send_eval_script("window.location.reload();") {
+                            eprintln!("failed to reload frontend from system tray: {err:#}");
+                        }
+                    }
+                    Ok(TrayCommand::Activate) => {
+                        if let Err(err) = raw_host_handle.request_activation() {
+                            eprintln!("failed to request raw host activation from system tray: {err:#}");
+                        }
+                        if let Err(err) = helper.send_eval_script(
+                            "try{window.focus();document.body&&document.body.focus&&document.body.focus();}catch(_err){}",
+                        ) {
+                            eprintln!("failed to activate frontend from system tray: {err:#}");
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
         if !raw_host_handle.is_running() && !stop_requested.load(Ordering::Relaxed) {
             eprintln!("raw host exited; requesting helper shutdown");
             stop_requested.store(true, Ordering::Relaxed);
