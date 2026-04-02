@@ -52,6 +52,9 @@ pub enum HostEvent {
     SaveDialogResult {
         path: Option<String>,
     },
+    AppCommandComplete {
+        command: String,
+    },
     FileRead {
         path: String,
         name: String,
@@ -79,6 +82,7 @@ pub enum FrontendCommand {
     OpenExternal { url: String },
     GetClipboardText,
     SetClipboardText { text: String },
+    ExitApp,
     MoveWindowToDisplay { screen_x: i32, screen_y: i32 },
     MoveWindowToDisplayId { display_id: String },
     OpenFileDialog {
@@ -146,6 +150,7 @@ pub struct HostCapabilitiesSnapshot {
     pub clipboard: bool,
     pub move_window: bool,
     pub file_dialog: bool,
+    pub app_control: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +213,14 @@ pub fn init_script() -> &'static str {
   let latestScreenInfo = null;
   let latestWindowState = null;
   let latestDarkMode = false;
+  if (!window.__NEKO_DISABLE_DEFAULT_CONTEXT_MENU__) {
+    window.__NEKO_DISABLE_DEFAULT_CONTEXT_MENU__ = true;
+    const blockContextMenu = (event) => {
+      event.preventDefault();
+    };
+    window.addEventListener('contextmenu', blockContextMenu, { capture: true });
+    document.addEventListener('contextmenu', blockContextMenu, { capture: true });
+  }
   function updateHostedWindowThemes() {
     const isDark = !!latestDarkMode;
     document.querySelectorAll('.neko-hosted-window').forEach((node) => {
@@ -412,6 +425,9 @@ pub fn init_script() -> &'static str {
     setClipboardText(text) {
       return waitForEvent('clipboard_text', { cmd: 'set_clipboard_text', text: String(text) }).then((payload) => payload.text ?? '');
     },
+    exitApp() {
+      return waitForEvent('app_command_complete', { cmd: 'exit_app' }).then(() => true);
+    },
     moveWindowToDisplayId(displayId) {
       return waitForEvent('window_state', {
         cmd: 'move_window_to_display_id',
@@ -478,6 +494,222 @@ pub fn init_script() -> &'static str {
       return this.get().then((current) => this.set(!current));
     }
   };
+  function systrayLocaleKey() {
+    const candidates = [
+      (() => { try { return window.localStorage.getItem('i18nextLng'); } catch (_) { return null; } })(),
+      (() => { try { return window.localStorage.getItem('userLanguage'); } catch (_) { return null; } })(),
+      navigator.language,
+      navigator.userLanguage
+    ].filter(Boolean).map((value) => String(value).toLowerCase());
+    for (const value of candidates) {
+      if (value.startsWith('zh-tw') || value.startsWith('zh-hk') || value.startsWith('zh-hant')) return 'zh-TW';
+      if (value.startsWith('zh')) return 'zh-CN';
+      if (value.startsWith('ja')) return 'ja';
+      if (value.startsWith('ko')) return 'ko';
+      if (value.startsWith('ru')) return 'ru';
+      if (value.startsWith('en')) return 'en';
+    }
+    return 'en';
+  }
+  const systrayTexts = {
+    'zh-CN': { tooltip: '系统菜单', title: 'N.E.K.O.', displays: '显示器', darkMode: '暗色模式', feedback: '反馈与建议', reload: '重新加载', exit: '退出', currentDisplay: '当前屏幕', moveHere: '移动到这里' },
+    'zh-TW': { tooltip: '系統選單', title: 'N.E.K.O.', displays: '顯示器', darkMode: '深色模式', feedback: '意見回饋', reload: '重新載入', exit: '退出', currentDisplay: '目前螢幕', moveHere: '移動到這裡' },
+    'ja': { tooltip: 'システムメニュー', title: 'N.E.K.O.', displays: 'ディスプレイ', darkMode: 'ダークモード', feedback: 'フィードバック', reload: '再読み込み', exit: '終了', currentDisplay: '現在の画面', moveHere: 'ここに移動' },
+    'ko': { tooltip: '시스템 메뉴', title: 'N.E.K.O.', displays: '디스플레이', darkMode: '다크 모드', feedback: '피드백', reload: '새로고침', exit: '종료', currentDisplay: '현재 화면', moveHere: '여기로 이동' },
+    'ru': { tooltip: 'Системное меню', title: 'N.E.K.O.', displays: 'Мониторы', darkMode: 'Темная тема', feedback: 'Обратная связь', reload: 'Перезагрузить', exit: 'Выход', currentDisplay: 'Текущий экран', moveHere: 'Переместить сюда' },
+    'en': { tooltip: 'System menu', title: 'N.E.K.O.', displays: 'Displays', darkMode: 'Dark mode', feedback: 'Feedback', reload: 'Reload', exit: 'Exit', currentDisplay: 'Current display', moveHere: 'Move here' }
+  };
+  function systrayT(key) {
+    const table = systrayTexts[systrayLocaleKey()] || systrayTexts.en;
+    return table[key] || systrayTexts.en[key] || key;
+  }
+  function installSystrayMenu() {
+    if (window.__NEKO_SYSTRAY_MENU_INSTALLED__) return;
+    window.__NEKO_SYSTRAY_MENU_INSTALLED__ = true;
+    let observer = null;
+    let repairTimer = 0;
+    const mount = () => {
+      if (!document.body || document.getElementById('neko-systray-menu')) return;
+      let style = document.getElementById('neko-systray-style');
+      if (!style) {
+        style = document.createElement('style');
+        style.id = 'neko-systray-style';
+        style.textContent = `
+        .neko-systray-location { position: fixed; right: 16px; bottom: 16px; z-index: 2147482400; pointer-events: auto; }
+        .neko-systray-menu { position: relative; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+        .neko-systray-menu__button { width: 52px; height: 52px; border: 1px solid rgba(255,255,255,0.26); border-radius: 18px; background: linear-gradient(180deg, rgba(22,28,36,0.92), rgba(12,16,22,0.82)); box-shadow: 0 16px 42px rgba(0,0,0,0.28); color: #f8fafc; font-size: 22px; cursor: pointer; backdrop-filter: blur(16px) saturate(140%); }
+        .neko-systray-menu__panel { min-width: 248px; max-width: min(320px, calc(100vw - 32px)); padding: 12px; border-radius: 18px; background: rgba(15,23,42,0.92); color: #e5eef8; border: 1px solid rgba(148,163,184,0.24); box-shadow: 0 24px 70px rgba(2,6,23,0.42); backdrop-filter: blur(18px) saturate(145%); }
+        .neko-systray-menu__panel[hidden] { display: none; }
+        .neko-systray-menu__title { margin: 0 0 10px; font-size: 14px; font-weight: 700; letter-spacing: 0.04em; }
+        .neko-systray-menu__section { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+        .neko-systray-menu__label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(226,232,240,0.72); }
+        .neko-systray-menu__item, .neko-systray-menu__display { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 0; border-radius: 12px; background: rgba(30,41,59,0.74); color: inherit; cursor: pointer; text-align: left; }
+        .neko-systray-menu__item:hover, .neko-systray-menu__display:hover { background: rgba(51,65,85,0.94); }
+        .neko-systray-menu__display[data-current="true"] { background: rgba(14,116,144,0.92); }
+        .neko-systray-menu__meta { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+        .neko-systray-menu__meta strong { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .neko-systray-menu__meta span { font-size: 11px; color: rgba(226,232,240,0.72); }
+        .neko-systray-menu__check { inline-size: 18px; block-size: 18px; border-radius: 999px; border: 1px solid rgba(226,232,240,0.42); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; flex: none; }
+      `;
+        (document.head || document.documentElement).appendChild(style);
+      }
+      const location = document.createElement('div');
+      location.className = 'neko-systray-location';
+      location.setAttribute('data-neko-interactive', 'systray-location');
+      const root = document.createElement('div');
+      root.id = 'neko-systray-menu';
+      root.className = 'neko-systray-menu';
+      root.setAttribute('data-neko-interactive', 'systray');
+      const panel = document.createElement('section');
+      panel.className = 'neko-systray-menu__panel';
+      panel.hidden = true;
+      panel.setAttribute('data-neko-interactive', 'systray-panel');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'neko-systray-menu__button';
+      button.textContent = 'N';
+      button.setAttribute('aria-label', systrayT('tooltip'));
+      button.title = systrayT('tooltip');
+      button.setAttribute('data-neko-interactive', 'systray-button');
+      root.appendChild(panel);
+      root.appendChild(button);
+      location.appendChild(root);
+      document.body.appendChild(location);
+      try { console.log('NEKO_SYSTRAY_MENU mounted'); } catch (_) {}
+
+      const closeMenu = () => {
+        panel.hidden = true;
+        root.dataset.open = 'false';
+      };
+      const openMenu = () => {
+        panel.hidden = false;
+        root.dataset.open = 'true';
+        void renderMenu();
+      };
+      async function renderMenu() {
+        let displays = [];
+        let currentDisplayId = null;
+        let darkMode = latestDarkMode;
+        try {
+          const screenInfo = latestScreenInfo || await waitForEvent('screen_info', { cmd: 'get_screen_info' });
+          displays = Array.isArray(screenInfo && screenInfo.displays) ? screenInfo.displays : [];
+          currentDisplayId = screenInfo && screenInfo.current_display_id ? String(screenInfo.current_display_id) : null;
+        } catch (_) {}
+        try {
+          darkMode = await window.nekoDarkMode.get();
+        } catch (_) {}
+        panel.replaceChildren();
+        const title = document.createElement('h2');
+        title.className = 'neko-systray-menu__title';
+        title.textContent = systrayT('title');
+        panel.appendChild(title);
+        const displaySection = document.createElement('div');
+        displaySection.className = 'neko-systray-menu__section';
+        const displayLabel = document.createElement('div');
+        displayLabel.className = 'neko-systray-menu__label';
+        displayLabel.textContent = systrayT('displays');
+        displaySection.appendChild(displayLabel);
+        displays.forEach((display, index) => {
+          const item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'neko-systray-menu__display';
+          item.dataset.current = String(display.id === currentDisplayId);
+          const meta = document.createElement('div');
+          meta.className = 'neko-systray-menu__meta';
+          const name = document.createElement('strong');
+          name.textContent = display.name || ('Display ' + (index + 1));
+          const desc = document.createElement('span');
+          desc.textContent = display.id === currentDisplayId ? systrayT('currentDisplay') : systrayT('moveHere');
+          meta.appendChild(name);
+          meta.appendChild(desc);
+          const check = document.createElement('span');
+          check.className = 'neko-systray-menu__check';
+          check.textContent = display.id === currentDisplayId ? '●' : '○';
+          item.appendChild(meta);
+          item.appendChild(check);
+          item.addEventListener('click', async () => {
+            try { await window.NekoHost.moveWindowToDisplayId(display.id); } catch (_) {}
+            await renderMenu();
+          });
+          displaySection.appendChild(item);
+        });
+        panel.appendChild(displaySection);
+        const controlsSection = document.createElement('div');
+        controlsSection.className = 'neko-systray-menu__section';
+        const darkModeItem = document.createElement('button');
+        darkModeItem.type = 'button';
+        darkModeItem.className = 'neko-systray-menu__item';
+        darkModeItem.innerHTML = '<span>' + systrayT('darkMode') + '</span><span class="neko-systray-menu__check">' + (darkMode ? '●' : '○') + '</span>';
+        darkModeItem.addEventListener('click', async () => {
+          try { await window.nekoDarkMode.toggle(); } catch (_) {}
+          await renderMenu();
+        });
+        controlsSection.appendChild(darkModeItem);
+        const feedbackItem = document.createElement('button');
+        feedbackItem.type = 'button';
+        feedbackItem.className = 'neko-systray-menu__item';
+        feedbackItem.textContent = systrayT('feedback');
+        feedbackItem.addEventListener('click', async () => {
+          closeMenu();
+          try { await window.electronShell.openExternal('https://github.com/wislap/N.E.K.O.-PC-wayland/issues/new'); } catch (_) {}
+        });
+        controlsSection.appendChild(feedbackItem);
+        const reloadItem = document.createElement('button');
+        reloadItem.type = 'button';
+        reloadItem.className = 'neko-systray-menu__item';
+        reloadItem.textContent = systrayT('reload');
+        reloadItem.addEventListener('click', () => {
+          closeMenu();
+          window.location.reload();
+        });
+        controlsSection.appendChild(reloadItem);
+        const exitItem = document.createElement('button');
+        exitItem.type = 'button';
+        exitItem.className = 'neko-systray-menu__item';
+        exitItem.textContent = systrayT('exit');
+        exitItem.addEventListener('click', async () => {
+          closeMenu();
+          try { await window.NekoHost.exitApp(); } catch (_) {}
+        });
+        controlsSection.appendChild(exitItem);
+        panel.appendChild(controlsSection);
+      }
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (panel.hidden) openMenu();
+        else closeMenu();
+      });
+      document.addEventListener('pointerdown', (event) => {
+        if (!root.contains(event.target)) closeMenu();
+      }, { passive: true });
+      window.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') closeMenu();
+      });
+      window.NekoHost.addEventListener((payload) => {
+        if (!payload || panel.hidden) return;
+        if (payload.type === 'screen_info' || payload.type === 'dark_mode_changed' || payload.type === 'window_state') {
+          void renderMenu();
+        }
+      });
+    };
+    const ensureMounted = () => {
+      if (!document.getElementById('neko-systray-menu')) {
+        mount();
+      }
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', ensureMounted, { once: true });
+    } else {
+      ensureMounted();
+    }
+    observer = new MutationObserver(() => ensureMounted());
+    const observeRoot = document.documentElement || document;
+    if (observeRoot && typeof observer.observe === 'function') {
+      observer.observe(observeRoot, { childList: true, subtree: true });
+    }
+    repairTimer = window.setInterval(ensureMounted, 1500);
+  }
+  installSystrayMenu();
   window.electronShell = window.electronShell || {
     openExternal(url) {
       return waitForEvent('external_opened', { cmd: 'open_external', url: String(url) }).then(() => true);
@@ -1341,6 +1573,7 @@ pub enum HostRequest {
     OpenExternal { url: String },
     GetClipboardText,
     SetClipboardText { text: String },
+    ExitApp,
     MoveWindowToDisplay { screen_x: i32, screen_y: i32 },
     MoveWindowToDisplayId { display_id: String },
     OpenFileDialog {
@@ -1392,6 +1625,7 @@ pub fn handle_frontend_message(
         Ok(FrontendCommand::SetClipboardText { text }) => {
             HostAction::Request(HostRequest::SetClipboardText { text })
         }
+        Ok(FrontendCommand::ExitApp) => HostAction::Request(HostRequest::ExitApp),
         Ok(FrontendCommand::MoveWindowToDisplay { screen_x, screen_y }) => {
             HostAction::Request(HostRequest::MoveWindowToDisplay { screen_x, screen_y })
         }

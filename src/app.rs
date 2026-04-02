@@ -38,6 +38,7 @@ use crate::shutdown::register_ctrlc_flag;
 use crate::standalone_helper::{
     CStandaloneHelperConfig, CStandaloneHelperEvent, CStandaloneHelperHandle,
 };
+use crate::tray;
 use crate::wayland::detect::WaylandProfile;
 use crate::wayland::strategy::{StrategySelection, choose_strategy};
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
@@ -244,6 +245,7 @@ fn host_capabilities() -> HostCapabilitiesSnapshot {
         clipboard: true,
         move_window: true,
         file_dialog: true,
+        app_control: true,
     }
 }
 
@@ -585,11 +587,63 @@ pub fn run(config: AppConfig) -> Result<()> {
         strategy.tier, strategy.reason
     );
 
+    if matches!(
+        config.wayland_host_mode,
+        WaylandHostMode::RawOnly | WaylandHostMode::OfficialHelperRun | WaylandHostMode::CStandaloneProbe
+    ) {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        register_ctrlc_flag(stop_requested.clone())?;
+        let tray_handle = tray::spawn_system_tray(stop_requested.clone(), config.dark_mode)?;
+
+        let result = match config.wayland_host_mode {
+            WaylandHostMode::RawOnly => {
+                #[cfg(feature = "cef_osr")]
+                {
+                    eprintln!("running in raw-only Wayland host mode with CEF OSR");
+                    run_raw_only_cef(config, stop_requested.clone(), &tray_handle)
+                }
+
+                #[cfg(not(feature = "cef_osr"))]
+                {
+                    eprintln!("running in raw-only Wayland host mode");
+                    crate::wayland::raw_host::run(build_raw_host_config(
+                        &config,
+                        current_input_region_or_empty(&config),
+                        true,
+                    ))
+                }
+            }
+            WaylandHostMode::OfficialHelperRun => {
+                eprintln!("running in official helper runtime mode");
+                run_official_helper_runtime(&config, stop_requested.clone())
+            }
+            WaylandHostMode::CStandaloneProbe => {
+                eprintln!("running in C standalone helper probe mode");
+                run_c_standalone_probe(
+                    &config,
+                    &profile,
+                    &strategy,
+                    stop_requested.clone(),
+                    &tray_handle,
+                )
+            }
+            _ => unreachable!("non-tray mode should not enter tray dispatch"),
+        };
+
+        stop_requested.store(true, Ordering::Relaxed);
+        tray_handle.join();
+        return result;
+    }
+
     if matches!(config.wayland_host_mode, WaylandHostMode::RawOnly) {
         #[cfg(feature = "cef_osr")]
         {
             eprintln!("running in raw-only Wayland host mode with CEF OSR");
-            return run_raw_only_cef(config);
+            return run_raw_only_cef(
+                config,
+                Arc::new(AtomicBool::new(false)),
+                &tray::SystemTrayHandle::detached(),
+            );
         }
 
         #[cfg(not(feature = "cef_osr"))]
@@ -608,16 +662,6 @@ pub fn run(config: AppConfig) -> Result<()> {
         return run_official_helper_probe(&config);
     }
 
-    if matches!(config.wayland_host_mode, WaylandHostMode::OfficialHelperRun) {
-        eprintln!("running in official helper runtime mode");
-        return run_official_helper_runtime(&config);
-    }
-
-    if matches!(config.wayland_host_mode, WaylandHostMode::CStandaloneProbe) {
-        eprintln!("running in C standalone helper probe mode");
-        return run_c_standalone_probe(&config, &profile, &strategy);
-    }
-
     bail!(
         "unsupported NEKO_WAYLAND_HOST_MODE {:?}; the legacy webview path has been removed, use the raw CEF default or an explicit helper mode",
         config.wayland_host_mode
@@ -625,10 +669,11 @@ pub fn run(config: AppConfig) -> Result<()> {
 }
 
 #[cfg(feature = "cef_osr")]
-fn run_raw_only_cef(config: AppConfig) -> Result<()> {
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    register_ctrlc_flag(stop_requested.clone())?;
-
+fn run_raw_only_cef(
+    config: AppConfig,
+    stop_requested: Arc<AtomicBool>,
+    tray_handle: &tray::SystemTrayHandle,
+) -> Result<()> {
     let mut launcher_runtime = Some(launcher::start_launcher(&config)?);
     let frontend_ports = match launcher::wait_for_frontend_url_until(
         launcher_runtime
@@ -750,6 +795,7 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
         .thread
         .handle
         .clone();
+    tray_handle.attach_raw_host(primary_handle.clone());
     let mut input_sources = Vec::with_capacity(spawned_hosts.len());
     for host in &spawned_hosts {
         let handle = host.thread.handle.clone();
@@ -991,7 +1037,10 @@ fn run_official_helper_probe(config: &AppConfig) -> Result<()> {
     bail!("official helper exited with status {status}");
 }
 
-fn run_official_helper_runtime(config: &AppConfig) -> Result<()> {
+fn run_official_helper_runtime(
+    config: &AppConfig,
+    stop_requested: Arc<AtomicBool>,
+) -> Result<()> {
     let launcher_runtime = launcher::start_launcher(config)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
     let frontend_url = frontend_ports
@@ -1014,8 +1063,6 @@ fn run_official_helper_runtime(config: &AppConfig) -> Result<()> {
     );
 
     let mut helper = OfficialHelperHandle::spawn(&helper_config)?;
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    install_shutdown_flag_handler(stop_requested.clone())?;
     let started = helper.wait_for_startup(Duration::from_secs(2))?;
     eprintln!("official helper runtime startup event observed: {started}");
     let spawned_pid = helper.wait_for_spawned(Duration::from_secs(2))?;
@@ -1118,6 +1165,7 @@ fn handle_raw_host_request(
     profile: &WaylandProfile,
     strategy: &StrategySelection,
     dark_mode_enabled: &mut bool,
+    stop_requested: &Arc<AtomicBool>,
 ) -> Option<HostEvent> {
     match request {
         HostRequest::GetHostInfo => {
@@ -1153,6 +1201,12 @@ fn handle_raw_host_request(
                 message: format!("failed to write clipboard text: {err}"),
             }),
         },
+        HostRequest::ExitApp => {
+            stop_requested.store(true, Ordering::Relaxed);
+            Some(HostEvent::AppCommandComplete {
+                command: "exit_app".to_string(),
+            })
+        }
         HostRequest::MoveWindowToDisplay { screen_x, screen_y } => {
             let target = raw_host.displays().into_iter().find(|display| {
                 screen_x >= display.x
@@ -1161,8 +1215,15 @@ fn handle_raw_host_request(
                     && screen_y < display.y + display.height as i32
             });
             match target {
-                Some(display) => match raw_host.set_target_output_id(Some(display.id)) {
-                    Ok(()) => Some(collect_raw_window_state(raw_host)),
+                Some(display) => match raw_host.set_target_output_id(Some(display.id.clone())) {
+                    Ok(()) => {
+                        if let Err(err) =
+                            desktop_config::persist_target_display(Some(display.id.as_str()))
+                        {
+                            eprintln!("failed to persist target display selection: {err:#}");
+                        }
+                        Some(collect_raw_window_state(raw_host))
+                    }
                     Err(err) => Some(HostEvent::Error {
                         message: format!("failed to move raw host to display: {err}"),
                     }),
@@ -1176,7 +1237,14 @@ fn handle_raw_host_request(
         }
         HostRequest::MoveWindowToDisplayId { display_id } => {
             match raw_host.set_target_output_id(Some(display_id)) {
-                Ok(()) => Some(collect_raw_window_state(raw_host)),
+                Ok(()) => {
+                    if let Err(err) =
+                        desktop_config::persist_target_display(raw_host.current_output_id().as_deref())
+                    {
+                        eprintln!("failed to persist target display selection: {err:#}");
+                    }
+                    Some(collect_raw_window_state(raw_host))
+                }
                 Err(err) => Some(HostEvent::Error {
                     message: format!("failed to move raw host to display id: {err}"),
                 }),
@@ -1246,6 +1314,8 @@ fn run_c_standalone_probe(
     config: &AppConfig,
     profile: &WaylandProfile,
     strategy: &StrategySelection,
+    stop_requested: Arc<AtomicBool>,
+    tray_handle: &tray::SystemTrayHandle,
 ) -> Result<()> {
     let launcher_runtime = launcher::start_launcher(config)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
@@ -1275,6 +1345,7 @@ fn run_c_standalone_probe(
     let raw_host = spawn_raw_host(build_raw_cef_host_config(config, false))
         .context("failed to spawn raw host for C standalone probe")?;
     let raw_host_handle = raw_host.handle.clone();
+    tray_handle.attach_raw_host(raw_host_handle.clone());
     let pointer_events = raw_host_handle.subscribe_pointer_events();
     let keyboard_events = raw_host_handle.subscribe_keyboard_events();
 
@@ -1347,8 +1418,6 @@ fn run_c_standalone_probe(
     );
     let mut helper = CStandaloneHelperHandle::spawn(&helper_config)?;
     drop(shared_frame_writer);
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    install_shutdown_flag_handler(stop_requested.clone())?;
     let mut launcher_runtime = Some(launcher_runtime);
 
     let mut saw_initialize_ok = false;
@@ -1492,6 +1561,7 @@ fn run_c_standalone_probe(
                                 profile,
                                 strategy,
                                 &mut dark_mode_enabled,
+                                &stop_requested,
                             ) {
                                 helper.send_eval_script(&build_emit_script(&event)?)?;
                                 if matches!(event, HostEvent::WindowState { .. } | HostEvent::ScreenInfo { .. }) {
@@ -1818,10 +1888,6 @@ fn apply_c_standalone_event(
         }
     }
     Ok(())
-}
-
-fn install_shutdown_flag_handler(stop_requested: Arc<AtomicBool>) -> Result<()> {
-    register_ctrlc_flag(stop_requested)
 }
 
 fn build_raw_host_config(

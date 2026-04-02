@@ -107,6 +107,41 @@ pub fn persist_dark_mode(enabled: bool) -> Result<()> {
     save(&config)
 }
 
+pub fn persist_target_display(display_id: Option<&str>) -> Result<()> {
+    let path = app_config_path();
+    let mut config = if path.exists() {
+        load_from_path(&path)?
+    } else {
+        DesktopAppConfig::default()
+    };
+    config.target_display_id = display_id.map(ToOwned::to_owned);
+    config.target_display_index = None;
+    config.target_display_name = None;
+    save(&config)
+}
+
+pub fn persist_streamer_mode(enabled: bool) -> Result<()> {
+    let path = app_config_path();
+    let mut config = if path.exists() {
+        load_from_path(&path)?
+    } else {
+        DesktopAppConfig::default()
+    };
+    config.streamer_mode = Some(enabled);
+    save(&config)
+}
+
+pub fn persist_compatibility_mode(enabled: bool) -> Result<()> {
+    let path = app_config_path();
+    let mut config = if path.exists() {
+        load_from_path(&path)?
+    } else {
+        DesktopAppConfig::default()
+    };
+    config.compatibility_mode = Some(enabled);
+    save(&config)
+}
+
 pub fn write_shared_port_config(ports: &PortConfig) -> Result<()> {
     let path = shared_port_config_path();
     if let Some(parent) = path.parent() {

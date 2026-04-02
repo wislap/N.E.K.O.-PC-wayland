@@ -9,4 +9,5 @@ pub mod launcher;
 pub mod official_helper;
 pub mod shutdown;
 pub mod standalone_helper;
+pub mod tray;
 pub mod wayland;
