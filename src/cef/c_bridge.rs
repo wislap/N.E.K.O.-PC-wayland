@@ -29,6 +29,8 @@ use crate::cef::c_shim::{
     neko_cef_bridge_initialize, neko_cef_bridge_message_loop_mode, neko_cef_bridge_shutdown,
 };
 use crate::cef::events::{CefLifecycleEvent, emit as emit_lifecycle_event};
+use crate::desktop_config;
+use crate::language;
 use crate::wayland::raw_host::{
     RawHostFrame, RawHostHandle, RawHostKeyboardEvent, RawHostModifiers, RawHostPointerButton,
     RawHostPointerEvent,
@@ -96,10 +98,7 @@ impl CefCBridgeRuntime {
             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
         );
 
-        let cache_root = runtime_plan
-            .sdk
-            .root
-            .join(format!("neko-cef-c-bridge-{}", std::process::id()));
+        let cache_root = default_cache_root(&runtime_plan);
         std::fs::create_dir_all(&cache_root).with_context(|| {
             format!("failed to create CEF cache root {}", cache_root.display())
         })?;
@@ -118,7 +117,7 @@ impl CefCBridgeRuntime {
         };
         let resources_dir = CString::new(runtime_plan.resources_dir.to_string_lossy().as_bytes())?;
         let locales_dir = CString::new(runtime_plan.locales_dir.to_string_lossy().as_bytes())?;
-        let locale = CString::new(default_cef_locale().unwrap_or_else(|| "en-US".to_string()))?;
+        let locale = CString::new(language::default_cef_locale())?;
         let cache_path = CString::new(cache_dir.to_string_lossy().as_bytes())?;
         let root_cache_path = CString::new(cache_root.to_string_lossy().as_bytes())?;
 
@@ -268,6 +267,22 @@ impl CefCBridgeRuntime {
             message_loop_mode,
         })
     }
+}
+
+fn default_cache_root(runtime_plan: &CefRuntimePlan) -> std::path::PathBuf {
+    if let Ok(value) = std::env::var("NEKO_CEF_CACHE_ROOT") {
+        return std::path::PathBuf::from(value);
+    }
+
+    let cache_root = desktop_config::cef_profile_root().join("c-bridge");
+    if let Err(err) = std::fs::create_dir_all(&cache_root) {
+        eprintln!(
+            "C bridge cache root creation failed at {}: {err}; falling back to SDK-local profile",
+            cache_root.display()
+        );
+        return runtime_plan.sdk.root.join("neko-cef-c-bridge");
+    }
+    cache_root
 }
 
 impl Drop for CefCBridgeRuntime {
@@ -575,30 +590,6 @@ fn error_buffer_to_string(buffer: &[i8]) -> String {
         return "unknown C bridge error".to_string();
     }
     unsafe { CStr::from_ptr(ptr) }.to_string_lossy().trim().to_string()
-}
-
-fn default_cef_locale() -> Option<String> {
-    let raw = std::env::var("LC_ALL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("LANG").ok())?;
-    let normalized = raw
-        .split('.')
-        .next()
-        .unwrap_or(raw.as_str())
-        .split('@')
-        .next()
-        .unwrap_or(raw.as_str())
-        .replace('_', "-");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("c")
-        || trimmed.eq_ignore_ascii_case("posix")
-    {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
 }
 
 fn ensure_runtime_library_path(runtime_plan: &CefRuntimePlan) {

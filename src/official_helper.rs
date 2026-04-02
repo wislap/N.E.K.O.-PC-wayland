@@ -11,6 +11,9 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::desktop_config;
+use crate::language;
+
 const EVENT_PREFIX: &str = "NEKO_CEF_HELPER_EVENT ";
 
 #[derive(Debug, Clone)]
@@ -151,28 +154,19 @@ fn default_profile_dir(runtime_dir: &Path) -> PathBuf {
         return PathBuf::from(value);
     }
 
-    runtime_dir.join(format!("user-data-{}", std::process::id()))
+    let profile_dir = desktop_config::cef_profile_root().join("official-helper");
+    if let Err(err) = std::fs::create_dir_all(&profile_dir) {
+        eprintln!(
+            "official helper profile dir creation failed at {}: {err}; falling back to runtime-local profile",
+            profile_dir.display()
+        );
+        return runtime_dir.join("user-data");
+    }
+    profile_dir
 }
 
 fn default_cef_lang() -> Option<String> {
-    let raw = std::env::var("LC_ALL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("LANG").ok())?;
-    let normalized = raw
-        .split('.')
-        .next()
-        .unwrap_or(raw.as_str())
-        .split('@')
-        .next()
-        .unwrap_or(raw.as_str())
-        .replace('_', "-");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("c") || trimmed.eq_ignore_ascii_case("posix") {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    Some(language::default_cef_locale())
 }
 
 fn has_cli_switch(args: &[String], exact: &str) -> bool {

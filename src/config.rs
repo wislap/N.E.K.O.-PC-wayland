@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::desktop_config::{self, DesktopAppConfig, PortConfig};
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,8 @@ pub struct AppConfig {
     pub render_fps: u32,
     pub fullscreen: bool,
     pub transparent_background: bool,
+    pub dark_mode: bool,
+    pub custom_ports: Option<PortConfig>,
     pub target_display_id: Option<String>,
     pub target_display_index: Option<usize>,
     pub target_display_name: Option<String>,
@@ -47,39 +50,86 @@ impl AppConfig {
             );
         }
 
+        let desktop = desktop_config::load_or_migrate(&repo_root)?;
+        if let Some(ports) = &desktop.custom_ports {
+            desktop_config::write_shared_port_config(ports)?;
+        }
+
         Ok(Self {
             repo_root,
             app_title: "N.E.K.O.-PC-wayland".to_string(),
             debug_input_region: parse_debug_input_region()?,
             trace_input_region: env_flag("NEKO_WAYLAND_TRACE_INPUT_REGION"),
             wayland_host_mode: parse_wayland_host_mode()?,
-            window_width: parse_dimension("NEKO_WAYLAND_WINDOW_WIDTH", 1920)?,
-            window_height: parse_dimension("NEKO_WAYLAND_WINDOW_HEIGHT", 1080)?,
-            render_width: parse_dimension("NEKO_WAYLAND_RENDER_WIDTH", default_render_width())?,
+            window_width: parse_dimension(
+                "NEKO_WAYLAND_WINDOW_WIDTH",
+                desktop
+                    .window_width
+                    .unwrap_or_else(|| default_window_width(&desktop)),
+            )?,
+            window_height: parse_dimension(
+                "NEKO_WAYLAND_WINDOW_HEIGHT",
+                desktop
+                    .window_height
+                    .unwrap_or_else(|| default_window_height(&desktop)),
+            )?,
+            render_width: parse_dimension(
+                "NEKO_WAYLAND_RENDER_WIDTH",
+                desktop
+                    .render_width
+                    .unwrap_or_else(|| default_render_width(&desktop)),
+            )?,
             render_height: parse_dimension(
                 "NEKO_WAYLAND_RENDER_HEIGHT",
-                default_render_height(),
+                desktop
+                    .render_height
+                    .unwrap_or_else(|| default_render_height(&desktop)),
             )?,
-            render_fps: parse_dimension("NEKO_WAYLAND_RENDER_FPS", default_render_fps())?,
-            fullscreen: parse_fullscreen_flag(),
-            transparent_background: parse_transparent_background_flag(),
-            target_display_id: parse_optional_nonempty_string("NEKO_WAYLAND_DISPLAY_ID"),
-            target_display_index: parse_optional_usize("NEKO_WAYLAND_DISPLAY_INDEX")?,
-            target_display_name: parse_optional_nonempty_string("NEKO_WAYLAND_DISPLAY_NAME"),
+            render_fps: parse_dimension(
+                "NEKO_WAYLAND_RENDER_FPS",
+                desktop
+                    .render_fps
+                    .unwrap_or_else(|| default_render_fps(&desktop)),
+            )?,
+            fullscreen: parse_fullscreen_flag(&desktop),
+            transparent_background: parse_transparent_background_flag(&desktop),
+            dark_mode: parse_dark_mode_flag(&desktop),
+            custom_ports: desktop.custom_ports.clone(),
+            target_display_id: parse_optional_nonempty_string(
+                "NEKO_WAYLAND_DISPLAY_ID",
+                desktop.target_display_id.clone(),
+            ),
+            target_display_index: parse_optional_usize(
+                "NEKO_WAYLAND_DISPLAY_INDEX",
+                desktop.target_display_index,
+            )?,
+            target_display_name: parse_optional_nonempty_string(
+                "NEKO_WAYLAND_DISPLAY_NAME",
+                desktop.target_display_name.clone(),
+            ),
         })
     }
 }
 
-fn default_render_width() -> u32 {
-    if parse_fullscreen_flag() { 1920 } else { 800 }
+fn default_window_width(desktop: &DesktopAppConfig) -> u32 {
+    if parse_fullscreen_flag(desktop) { 2560 } else { 1600 }
 }
 
-fn default_render_height() -> u32 {
-    if parse_fullscreen_flag() { 1080 } else { 600 }
+fn default_window_height(desktop: &DesktopAppConfig) -> u32 {
+    if parse_fullscreen_flag(desktop) { 1440 } else { 900 }
 }
 
-fn default_render_fps() -> u32 {
-    if parse_fullscreen_flag() { 60 } else { 30 }
+fn default_render_width(desktop: &DesktopAppConfig) -> u32 {
+    default_window_width(desktop)
+}
+
+fn default_render_height(desktop: &DesktopAppConfig) -> u32 {
+    default_window_height(desktop)
+}
+
+fn default_render_fps(desktop: &DesktopAppConfig) -> u32 {
+    let _ = desktop;
+    120
 }
 
 fn parse_dimension(name: &str, default: u32) -> Result<u32> {
@@ -97,9 +147,9 @@ fn parse_dimension(name: &str, default: u32) -> Result<u32> {
     Ok(value)
 }
 
-fn parse_optional_usize(name: &str) -> Result<Option<usize>> {
+fn parse_optional_usize(name: &str, fallback: Option<usize>) -> Result<Option<usize>> {
     let Some(raw) = env::var_os(name) else {
-        return Ok(None);
+        return Ok(fallback);
     };
     let value = raw
         .to_string_lossy()
@@ -109,30 +159,41 @@ fn parse_optional_usize(name: &str) -> Result<Option<usize>> {
     Ok(Some(value))
 }
 
-fn parse_optional_nonempty_string(name: &str) -> Option<String> {
+fn parse_optional_nonempty_string(name: &str, fallback: Option<String>) -> Option<String> {
     env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or(fallback)
 }
 
-fn parse_fullscreen_flag() -> bool {
+fn parse_fullscreen_flag(desktop: &DesktopAppConfig) -> bool {
     match env::var("NEKO_WAYLAND_FULLSCREEN") {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         ),
-        Err(_) => true,
+        Err(_) => desktop.fullscreen.unwrap_or(true),
     }
 }
 
-fn parse_transparent_background_flag() -> bool {
+fn parse_transparent_background_flag(desktop: &DesktopAppConfig) -> bool {
     match env::var("NEKO_WAYLAND_TRANSPARENT_BACKGROUND") {
         Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
         ),
-        Err(_) => true,
+        Err(_) => desktop.transparent_background.unwrap_or(true),
+    }
+}
+
+fn parse_dark_mode_flag(desktop: &DesktopAppConfig) -> bool {
+    match env::var("NEKO_WAYLAND_DARK_MODE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => desktop.dark_mode.unwrap_or(false),
     }
 }
 

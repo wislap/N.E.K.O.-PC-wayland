@@ -12,6 +12,7 @@ use crate::cef::ffi::{
     cef_app_t, cef_base_ref_counted_t, cef_browser_process_handler_t, cef_command_line_t,
     cef_string_t,
 };
+use crate::language;
 use crate::cef::strings::decode_cef_string;
 use crate::cef::strings::CefOwnedString;
 
@@ -312,27 +313,7 @@ unsafe fn append_extra_switches_from_env(command_line: *mut cef_command_line_t) 
 }
 
 fn default_cef_lang() -> String {
-    let raw = std::env::var("LC_ALL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("LANG").ok());
-    let Some(raw) = raw else {
-        return "en-US".to_string();
-    };
-    let normalized = raw
-        .split('.')
-        .next()
-        .unwrap_or(raw.as_str())
-        .split('@')
-        .next()
-        .unwrap_or(raw.as_str())
-        .replace('_', "-");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("c") || trimmed.eq_ignore_ascii_case("posix") {
-        "en-US".to_string()
-    } else {
-        trimmed.to_string()
-    }
+    language::default_cef_locale()
 }
 
 unsafe extern "C" fn browser_process_handler_add_ref(this: *mut cef_base_ref_counted_t) {

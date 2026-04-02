@@ -12,6 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::config::AppConfig;
+
 #[derive(Debug)]
 pub struct LauncherHandle {
     child: Child,
@@ -119,8 +121,8 @@ struct RuntimeSnapshotFile {
     payload: Value,
 }
 
-pub fn start_launcher(repo_root: &Path) -> Result<LauncherRuntime> {
-    let mut child = spawn_launcher(repo_root)?;
+pub fn start_launcher(config: &AppConfig) -> Result<LauncherRuntime> {
+    let mut child = spawn_launcher(config)?;
     let stdout = child
         .stdout
         .take()
@@ -172,11 +174,11 @@ pub fn start_launcher(repo_root: &Path) -> Result<LauncherRuntime> {
     })
 }
 
-fn spawn_launcher(repo_root: &Path) -> Result<Child> {
+fn spawn_launcher(config: &AppConfig) -> Result<Child> {
     let mut commands = Vec::new();
-    commands.push(build_uv_launcher(repo_root));
-    commands.push(build_python_launcher(repo_root, "python3"));
-    commands.push(build_python_launcher(repo_root, "python"));
+    commands.push(build_uv_launcher(config));
+    commands.push(build_python_launcher(config, "python3"));
+    commands.push(build_python_launcher(config, "python"));
 
     let mut last_error = None;
 
@@ -196,30 +198,44 @@ fn spawn_launcher(repo_root: &Path) -> Result<Child> {
     Err(last_error.unwrap_or_else(|| anyhow!("no launcher command available")))
 }
 
-fn build_uv_launcher(repo_root: &Path) -> Command {
+fn build_uv_launcher(config: &AppConfig) -> Command {
     let mut command = Command::new("uv");
     command
         .arg("run")
         .arg("python")
         .arg("launcher.py")
-        .current_dir(repo_root)
+        .current_dir(&config.repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_saved_launcher_envs(&mut command, config);
     apply_process_group(&mut command);
     command
 }
 
-fn build_python_launcher(repo_root: &Path, python: &str) -> Command {
+fn build_python_launcher(config: &AppConfig, python: &str) -> Command {
     let mut command = Command::new(python);
     command
         .arg("launcher.py")
-        .current_dir(repo_root)
+        .current_dir(&config.repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_saved_launcher_envs(&mut command, config);
     apply_process_group(&mut command);
     command
+}
+
+fn apply_saved_launcher_envs(command: &mut Command, config: &AppConfig) {
+    if let Some(ports) = &config.custom_ports {
+        command.env("NEKO_MAIN_SERVER_PORT", ports.main_server_port.to_string());
+        command.env("NEKO_MEMORY_SERVER_PORT", ports.memory_server_port.to_string());
+        command.env("NEKO_TOOL_SERVER_PORT", ports.tool_server_port.to_string());
+        command.env(
+            "NEKO_USER_PLUGIN_SERVER_PORT",
+            ports.user_plugin_server_port.to_string(),
+        );
+    }
 }
 
 fn apply_process_group(command: &mut Command) {

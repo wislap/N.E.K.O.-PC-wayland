@@ -101,6 +101,12 @@ pub struct SharedFrameReader {
     map_len: usize,
 }
 
+pub struct SharedFrameView<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: &'a [u8],
+}
+
 unsafe impl Send for SharedFrameReader {}
 
 pub struct FrameReader {
@@ -244,6 +250,45 @@ impl SharedFrameReader {
             }
             bgra.copy_from_slice(data);
             return Ok((header.width, header.height));
+        }
+
+        bail!("shared frame bridge is being updated, retry on next paint")
+    }
+
+    pub fn latest_view(
+        &self,
+        expected_width: u32,
+        expected_height: u32,
+    ) -> Result<SharedFrameView<'_>> {
+        let layout = SharedFrameLayout::new(expected_width, expected_height)?;
+        let root = self.read_root_header();
+        self.validate_root_header(&root, &layout)?;
+        let slot_index = root.latest_slot.min(layout.slot_count.saturating_sub(1));
+        let slot_offset = layout.slot_offset(slot_index);
+        for _ in 0..3 {
+            let before = self.read_slot_seq(slot_offset);
+            if before == 0 || before % 2 == 1 {
+                continue;
+            }
+            compiler_fence(Ordering::Acquire);
+            let header = self.read_slot_header(slot_offset);
+            compiler_fence(Ordering::Acquire);
+            let after = self.read_slot_seq(slot_offset);
+            if before != after || after % 2 == 1 {
+                continue;
+            }
+            self.validate_slot_header(&header, expected_width, expected_height, &layout)?;
+            let bgra = unsafe {
+                slice::from_raw_parts(
+                    self.map_ptr.add(slot_offset + SHARED_FRAME_SLOT_HEADER_SIZE),
+                    header.data_len as usize,
+                )
+            };
+            return Ok(SharedFrameView {
+                width: header.width,
+                height: header.height,
+                bgra,
+            });
         }
 
         bail!("shared frame bridge is being updated, retry on next paint")

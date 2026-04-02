@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crate::shutdown::register_ctrlc_running_flag;
@@ -48,7 +48,7 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewporter::WpViewporter,
 };
 
-use crate::frame_bridge::SharedFrameReader;
+use crate::frame_bridge::{SharedFrameReader, SharedFrameView};
 use crate::wayland::input_region::{InputRegion, InteractiveRect};
 
 #[derive(Debug, Clone)]
@@ -147,6 +147,33 @@ pub struct RawHostFrame {
     pub width: u32,
     pub height: u32,
     pub bgra: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameView<'a> {
+    width: u32,
+    height: u32,
+    bgra: &'a [u8],
+}
+
+impl RawHostFrame {
+    fn as_view(&self) -> FrameView<'_> {
+        FrameView {
+            width: self.width,
+            height: self.height,
+            bgra: &self.bgra,
+        }
+    }
+}
+
+impl<'a> From<SharedFrameView<'a>> for FrameView<'a> {
+    fn from(value: SharedFrameView<'a>) -> Self {
+        Self {
+            width: value.width,
+            height: value.height,
+            bgra: value.bgra,
+        }
+    }
 }
 
 impl RawHostFrame {
@@ -420,10 +447,11 @@ fn run_inner_with_running(
             visible_region: config.visible_region.clone(),
             frame: None,
             shared_frame_reader: None,
-            shared_frame: None,
+            shared_frame_dimensions: None,
             current_output_id: None,
             fullscreen_output_applied: false,
             input_region_applied: false,
+            last_auto_input_region_update_at: None,
             transparent_outside_input_region: config.transparent_outside_input_region,
             show_debug_regions_when_empty: config.show_debug_regions_when_empty,
             move_on_left_press: config.move_on_left_press,
@@ -752,10 +780,11 @@ struct RawHostRuntime {
     visible_region: Option<InputRegion>,
     frame: Option<RawHostFrame>,
     shared_frame_reader: Option<SharedFrameReader>,
-    shared_frame: Option<RawHostFrame>,
+    shared_frame_dimensions: Option<(u32, u32)>,
     current_output_id: Option<String>,
     fullscreen_output_applied: bool,
     input_region_applied: bool,
+    last_auto_input_region_update_at: Option<Instant>,
     transparent_outside_input_region: bool,
     show_debug_regions_when_empty: bool,
     move_on_left_press: bool,
@@ -792,6 +821,17 @@ struct RawHostApp {
 }
 
 impl RawHostApp {
+    fn with_current_frame_view<T>(&self, f: impl FnOnce(FrameView<'_>) -> T) -> Option<T> {
+        if let Some(frame) = self.runtime.frame.as_ref() {
+            return Some(f(frame.as_view()));
+        }
+
+        let (expected_width, expected_height) = self.runtime.shared_frame_dimensions?;
+        let reader = self.runtime.shared_frame_reader.as_ref()?;
+        let view = reader.latest_view(expected_width, expected_height).ok()?;
+        Some(f(view.into()))
+    }
+
     fn output_snapshot(
         info: &OutputInfo,
         current_output_id: Option<&str>,
@@ -1077,6 +1117,7 @@ impl RawHostApp {
     fn handle_command(&mut self, command: RawHostCommand) -> Result<()> {
         match command {
             RawHostCommand::SetInputRegion(region) => {
+                self.runtime.auto_input_region_from_frame_alpha = false;
                 self.runtime.source_input_region = region;
                 self.runtime.input_region = scale_input_region_to_window(
                     &self.runtime.source_input_region,
@@ -1135,7 +1176,7 @@ impl RawHostApp {
                     latest_frame.take();
                 }
                 self.runtime.frame = None;
-                self.runtime.shared_frame = None;
+                self.runtime.shared_frame_dimensions = None;
                 self.draw()?;
             }
             RawHostCommand::Shutdown => {
@@ -1159,7 +1200,7 @@ impl RawHostApp {
 
             if let Some(frame) = next_frame {
                 self.runtime.frame = Some(frame);
-                self.runtime.shared_frame = None;
+                self.runtime.shared_frame_dimensions = None;
                 self.update_auto_input_region_from_frame();
                 self.draw()?;
             }
@@ -1184,17 +1225,8 @@ impl RawHostApp {
             return Ok(());
         };
 
-        let mut frame = self.runtime.shared_frame.take().unwrap_or(RawHostFrame {
-            width,
-            height,
-            bgra: Arc::from([]),
-        });
-        let mut bgra = frame.bgra.as_ref().to_vec();
-        let (loaded_width, loaded_height) = reader.load_latest_into(&mut bgra, width, height)?;
-        frame.width = loaded_width;
-        frame.height = loaded_height;
-        frame.bgra = bgra.into();
-        self.runtime.shared_frame = Some(frame);
+        let shared_view = reader.latest_view(width, height)?;
+        self.runtime.shared_frame_dimensions = Some((shared_view.width, shared_view.height));
         self.runtime.frame = None;
         self.update_auto_input_region_from_frame();
         let result = self.draw();
@@ -1207,19 +1239,20 @@ impl RawHostApp {
             return;
         }
 
-        let frame = self
+        let now = Instant::now();
+        if self
             .runtime
-            .frame
-            .as_ref()
-            .or(self.runtime.shared_frame.as_ref());
-        let Some(frame) = frame else {
+            .last_auto_input_region_update_at
+            .is_some_and(|last| now.duration_since(last) < auto_input_region_update_interval())
+        {
+            return;
+        }
+
+        let Some(derived) = self.with_current_frame_view(|frame| {
+            derive_input_region_from_frame_alpha(&frame, self.runtime.frame_viewport.as_ref())
+        }) else {
             return;
         };
-
-        let derived = derive_input_region_from_frame_alpha(
-            frame,
-            self.runtime.frame_viewport.as_ref(),
-        );
         if derived != self.runtime.source_input_region {
             self.runtime.source_input_region = derived;
             self.runtime.input_region = scale_input_region_to_window(
@@ -1230,6 +1263,7 @@ impl RawHostApp {
             );
             self.runtime.input_region_applied = false;
         }
+        self.runtime.last_auto_input_region_update_at = Some(now);
     }
 
     fn apply_input_region(&mut self) -> Result<()> {
@@ -1307,35 +1341,43 @@ impl RawHostApp {
             .as_ref()
             .unwrap_or(&self.runtime.input_region);
         let frame_viewport = self.runtime.frame_viewport.as_ref();
-        let frame_ref = self
+        let owned_frame_ptr = self
             .runtime
             .frame
             .as_ref()
-            .or(self.runtime.shared_frame.as_ref());
+            .map(|frame| frame as *const RawHostFrame as usize);
+        let shared_reader_ptr = self
+            .runtime
+            .shared_frame_reader
+            .as_ref()
+            .map(|reader| reader as *const SharedFrameReader as usize);
+        let shared_frame_dimensions = self.runtime.shared_frame_dimensions;
 
-        if let Some(frame) = frame_ref {
+        let frame_rendered = if let Some(frame_ptr) = owned_frame_ptr {
+            let frame = unsafe { &*(frame_ptr as *const RawHostFrame) };
+            let frame = frame.as_view();
             if frame.width == draw_width
                 && frame.height == draw_height
                 && frame_viewport.is_none()
                 && region_covers_full_window(visible_region, width, height)
             {
-                blit_fullscreen_rgba_to_argb(canvas, frame);
+                blit_fullscreen_rgba_to_argb(canvas, &frame);
             } else if region_covers_full_window(visible_region, width, height)
                 && draw_width == width
                 && draw_height == height
                 && frame_viewport.is_none()
             {
-                blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, frame);
+                blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, &frame);
             } else if region_covers_full_window(visible_region, width, height) {
-                let viewport = frame_viewport_or_full(frame, frame_viewport);
-                if viewport_covers_full_frame(frame, &viewport) {
-                    blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, frame);
+                let viewport = frame_viewport_or_full(&frame, frame_viewport);
+                if viewport_covers_full_frame(&frame, &viewport) {
+                    blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, &frame);
                 } else {
                     blit_viewport_fullscreen_rgba_to_argb(
                         canvas,
                         draw_width,
                         draw_height,
-                        frame,
+                        &frame,
                         &viewport,
                     );
                 }
@@ -1344,13 +1386,64 @@ impl RawHostApp {
                     canvas,
                     draw_width,
                     draw_height,
-                    frame,
+                    &frame,
                     visible_region,
                     self.runtime.transparent_outside_input_region,
                     frame_viewport,
                 );
             }
+            true
+        } else if let (Some(reader_ptr), Some((expected_width, expected_height))) =
+            (shared_reader_ptr, shared_frame_dimensions)
+        {
+            let reader = unsafe { &*(reader_ptr as *const SharedFrameReader) };
+            if let Ok(shared_view) = reader.latest_view(expected_width, expected_height) {
+                let frame: FrameView<'_> = shared_view.into();
+                if frame.width == draw_width
+                    && frame.height == draw_height
+                    && frame_viewport.is_none()
+                    && region_covers_full_window(visible_region, width, height)
+                {
+                    blit_fullscreen_rgba_to_argb(canvas, &frame);
+                } else if region_covers_full_window(visible_region, width, height)
+                    && draw_width == width
+                    && draw_height == height
+                    && frame_viewport.is_none()
+                {
+                    blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, &frame);
+                } else if region_covers_full_window(visible_region, width, height) {
+                    let viewport = frame_viewport_or_full(&frame, frame_viewport);
+                    if viewport_covers_full_frame(&frame, &viewport) {
+                        blit_scaled_fullscreen_rgba_to_argb(canvas, draw_width, draw_height, &frame);
+                    } else {
+                        blit_viewport_fullscreen_rgba_to_argb(
+                            canvas,
+                            draw_width,
+                            draw_height,
+                            &frame,
+                            &viewport,
+                        );
+                    }
+                } else {
+                    draw_frame_with_regions(
+                        canvas,
+                        draw_width,
+                        draw_height,
+                        &frame,
+                        visible_region,
+                        self.runtime.transparent_outside_input_region,
+                        frame_viewport,
+                    );
+                }
+                true
+            } else {
+                false
+            }
         } else {
+            false
+        };
+
+        if !frame_rendered {
             draw_debug_background(
                 canvas,
                 draw_width,
@@ -1389,15 +1482,17 @@ impl RawHostApp {
         if !region_covers_full_window(visible_region, self.runtime.width, self.runtime.height) {
             return None;
         }
-        if let Some(frame) = self.runtime.frame.as_ref() {
-            let viewport = frame_viewport_or_full(frame, self.runtime.frame_viewport.as_ref());
-            return Some((viewport.width.max(1), viewport.height.max(1)));
-        }
-        self.runtime
-            .frame_viewport
-            .as_ref()
-            .map(|viewport| (viewport.width.max(1), viewport.height.max(1)))
-            .or(self.runtime.input_region_source_size)
+        self.with_current_frame_view(|frame| {
+            let viewport = frame_viewport_or_full(&frame, self.runtime.frame_viewport.as_ref());
+            (viewport.width.max(1), viewport.height.max(1))
+        })
+        .or_else(|| {
+            self.runtime
+                .frame_viewport
+                .as_ref()
+                .map(|viewport| (viewport.width.max(1), viewport.height.max(1)))
+                .or(self.runtime.input_region_source_size)
+        })
     }
 }
 
@@ -1467,7 +1562,7 @@ fn region_covers_full_window(region: &InputRegion, width: u32, height: u32) -> b
 }
 
 fn frame_viewport_or_full<'a>(
-    frame: &'a RawHostFrame,
+    frame: &'a FrameView<'_>,
     viewport: Option<&'a InteractiveRect>,
 ) -> InteractiveRect {
     viewport.cloned().unwrap_or(InteractiveRect {
@@ -1479,10 +1574,10 @@ fn frame_viewport_or_full<'a>(
 }
 
 fn derive_input_region_from_frame_alpha(
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
     viewport: Option<&InteractiveRect>,
 ) -> InputRegion {
-    const TILE: u32 = 16;
+    const TILE: u32 = 24;
     const ALPHA_THRESHOLD: u8 = 16;
 
     let viewport = frame_viewport_or_full(frame, viewport);
@@ -1568,8 +1663,16 @@ fn derive_input_region_from_frame_alpha(
     InputRegion::from_rects(rects)
 }
 
+fn auto_input_region_update_interval() -> Duration {
+    let millis = std::env::var("NEKO_AUTO_INPUT_REGION_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(120);
+    Duration::from_millis(millis.max(16))
+}
+
 fn tile_has_visible_alpha(
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
     x0: u32,
     y0: u32,
     x1: u32,
@@ -1588,14 +1691,14 @@ fn tile_has_visible_alpha(
     false
 }
 
-fn viewport_covers_full_frame(frame: &RawHostFrame, viewport: &InteractiveRect) -> bool {
+fn viewport_covers_full_frame(frame: &FrameView<'_>, viewport: &InteractiveRect) -> bool {
     viewport.x == 0
         && viewport.y == 0
         && viewport.width == frame.width
         && viewport.height == frame.height
 }
 
-fn blit_fullscreen_rgba_to_argb(canvas: &mut [u8], frame: &RawHostFrame) {
+fn blit_fullscreen_rgba_to_argb(canvas: &mut [u8], frame: &FrameView<'_>) {
     canvas.copy_from_slice(&frame.bgra);
 }
 
@@ -1603,7 +1706,7 @@ fn blit_viewport_fullscreen_rgba_to_argb(
     canvas: &mut [u8],
     dst_width: u32,
     dst_height: u32,
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
     viewport: &InteractiveRect,
 ) {
     if dst_width == 0 || dst_height == 0 || viewport.width == 0 || viewport.height == 0 {
@@ -1636,7 +1739,7 @@ fn blit_viewport_fullscreen_rgba_to_argb(
 fn blit_viewport_copy_rgba_to_argb(
     canvas: &mut [u8],
     dst_width: u32,
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
     viewport: &InteractiveRect,
 ) {
     let src_width = frame.width as usize;
@@ -1664,7 +1767,7 @@ fn blit_scaled_fullscreen_rgba_to_argb(
     canvas: &mut [u8],
     dst_width: u32,
     dst_height: u32,
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
 ) {
     if dst_width == 0 || dst_height == 0 || frame.width == 0 || frame.height == 0 {
         canvas.fill(0);
@@ -1701,7 +1804,7 @@ fn draw_frame_with_regions(
     canvas: &mut [u8],
     width: u32,
     height: u32,
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
     visible_region: &InputRegion,
     transparent_outside_input_region: bool,
     frame_viewport: Option<&InteractiveRect>,
@@ -1777,7 +1880,7 @@ fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
 }
 
 fn color_from_scaled_frame_or_background(
-    frame: &RawHostFrame,
+    frame: &FrameView<'_>,
     x: i32,
     y: i32,
     dst_width: u32,

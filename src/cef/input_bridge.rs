@@ -12,6 +12,12 @@ use crate::wayland::raw_host::{
     RawHostPointerEvent,
 };
 
+fn idle_pump_sleep(frame_rate: u32) -> Duration {
+    let frame_rate = frame_rate.max(1);
+    let millis = (1000 / frame_rate).clamp(1, 8);
+    Duration::from_millis(u64::from(millis))
+}
+
 fn input_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -60,6 +66,7 @@ pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, mut sources: Vec<RawInput
     let mut mouse_modifiers = 0_u32;
     let mut key_modifiers = 0_u32;
     let mut idle = false;
+    let idle_sleep = idle_pump_sleep(bridge.config().frame_rate);
 
     loop {
         let mut progressed = false;
@@ -115,7 +122,7 @@ pub fn run_multi_raw_input_loop(bridge: &CefOsrBridge, mut sources: Vec<RawInput
         }
 
         if idle {
-            thread::sleep(Duration::from_millis(16));
+            thread::sleep(idle_sleep);
         } else {
             idle = true;
         }

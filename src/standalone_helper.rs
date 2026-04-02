@@ -15,7 +15,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::from_str;
 use xkeysym::key;
 
+use crate::desktop_config;
 use crate::ipc::InteractiveRectPayload;
+use crate::language;
 use crate::wayland::raw_host::{
     RawHostKeyboardEvent, RawHostModifiers, RawHostPointerButton, RawHostPointerEvent,
 };
@@ -101,11 +103,7 @@ impl CStandaloneHelperConfig {
 
 impl CStandaloneHelperHandle {
     pub fn spawn(config: &CStandaloneHelperConfig) -> Result<Self> {
-        let cache_root = std::env::temp_dir().join(format!(
-            "neko-cef-standalone-cache-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
+        let cache_root = default_cache_root();
         let cache_dir = cache_root.join("cache");
         std::fs::create_dir_all(&cache_dir).with_context(|| {
             format!(
@@ -125,7 +123,7 @@ impl CStandaloneHelperHandle {
             )
             .env("NEKO_CEF_RESOURCES_DIR", &config.runtime_dir)
             .env("NEKO_CEF_LOCALES_DIR", config.runtime_dir.join("locales"))
-            .env("NEKO_CEF_LOCALE", "en-US")
+            .env("NEKO_CEF_LOCALE", language::default_cef_locale())
             .env("NEKO_CEF_ROOT_CACHE_PATH", &cache_root)
             .env("NEKO_CEF_CACHE_PATH", &cache_dir)
             .stdin(Stdio::piped())
@@ -382,11 +380,12 @@ impl CStandaloneHelperHandle {
     }
 }
 
-fn current_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+fn default_cache_root() -> PathBuf {
+    if let Ok(value) = std::env::var("NEKO_CEF_CACHE_ROOT") {
+        return PathBuf::from(value);
+    }
+
+    desktop_config::cef_profile_root().join("standalone-helper")
 }
 
 fn input_trace_enabled() -> bool {

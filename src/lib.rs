@@ -1,8 +1,10 @@
 pub mod app;
 pub mod cef;
 pub mod config;
+pub mod desktop_config;
 pub mod frame_bridge;
 pub mod ipc;
+pub mod language;
 pub mod launcher;
 pub mod official_helper;
 pub mod shutdown;

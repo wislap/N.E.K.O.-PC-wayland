@@ -194,6 +194,12 @@ impl CefOsrBridge {
     pub fn request_close(&self) {
         self.client_state.request_close();
     }
+
+    #[cfg(feature = "cef_osr")]
+    pub fn execute_javascript(&self, code: &str, script_url: &str, start_line: i32) {
+        self.client_state
+            .execute_javascript(code, script_url, start_line);
+    }
 }
 
 #[cfg(feature = "cef_osr")]

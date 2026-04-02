@@ -9,6 +9,8 @@ use anyhow::{Result, anyhow, bail};
 #[cfg(has_cef_sdk)]
 use crate::cef::app::{CefAppState, stash_pending_app, take_pending_app};
 use crate::cef::bootstrap::CefRuntimePlan;
+use crate::desktop_config;
+use crate::language;
 #[cfg(has_cef_sdk)]
 use crate::cef::ffi::{
     cef_api_hash, cef_api_version, cef_do_message_loop_work, cef_execute_process, cef_initialize,
@@ -103,7 +105,7 @@ impl CefSettingsBuilder {
             locale: CefOwnedString::new(if compat_c_probe {
                 "en-US".to_string()
             } else {
-                default_cef_locale().unwrap_or_else(|| "en-US".to_string())
+                language::default_cef_locale()
             }),
             background_color: 0,
             windowless_rendering_enabled: true,
@@ -126,7 +128,7 @@ impl CefSettingsBuilder {
             command_line_args_disabled: 0,
             cache_path: self.cache_path.into_raw(),
             root_cache_path: self.root_cache_path.into_raw(),
-            persist_session_cookies: 0,
+            persist_session_cookies: 1,
             user_agent: CefOwnedString::new("").into_raw(),
             user_agent_product: CefOwnedString::new("").into_raw(),
             locale: self.locale.into_raw(),
@@ -154,30 +156,15 @@ fn default_cache_root(plan: &CefRuntimePlan) -> std::path::PathBuf {
         return std::path::PathBuf::from(value);
     }
 
-    plan.sdk
-        .root
-        .join(format!("neko-cef-profile-{}", std::process::id()))
-}
-
-fn default_cef_locale() -> Option<String> {
-    let raw = std::env::var("LC_ALL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("LANG").ok())?;
-    let normalized = raw
-        .split('.')
-        .next()
-        .unwrap_or(raw.as_str())
-        .split('@')
-        .next()
-        .unwrap_or(raw.as_str())
-        .replace('_', "-");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("c") || trimmed.eq_ignore_ascii_case("posix") {
-        None
-    } else {
-        Some(trimmed.to_string())
+    let cache_root = desktop_config::cef_profile_root();
+    if let Err(err) = std::fs::create_dir_all(&cache_root) {
+        eprintln!(
+            "CEF cache root creation failed at {}: {err}; falling back to SDK-local profile",
+            cache_root.display()
+        );
+        return plan.sdk.root.join("neko-cef-profile");
     }
+    cache_root
 }
 
 pub fn detect_process_role() -> CefProcessRole {

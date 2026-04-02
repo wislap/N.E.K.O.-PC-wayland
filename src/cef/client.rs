@@ -11,12 +11,12 @@ use anyhow::Result;
 use crate::cef::events::{CefLifecycleEvent, emit as emit_lifecycle_event};
 use crate::cef::ffi::{
     cef_base_ref_counted_t, cef_browser_host_t, cef_browser_t, cef_client_t, cef_display_handler_t,
-    cef_key_event_t, cef_key_event_type_t, cef_life_span_handler_t, cef_load_handler_t,
+    cef_frame_t, cef_key_event_t, cef_key_event_type_t, cef_life_span_handler_t, cef_load_handler_t,
     cef_mouse_button_type_t, cef_mouse_event_t, cef_render_handler_t,
 };
 use crate::cef::log::trace_enabled;
 use crate::cef::render_handler::{CefRenderHandlerState, CefRenderHandlerWrapper, add_ref_raw};
-use crate::cef::strings::decode_cef_string;
+use crate::cef::strings::{CefOwnedString, decode_cef_string};
 use crate::cef::{CefKeyEventKind, CefMouseButton};
 use crate::wayland::raw_host::RawHostHandle;
 
@@ -304,6 +304,33 @@ impl CefClientState {
         }
 
         eprintln!("CEF request_close: timed out waiting for before_close");
+    }
+
+    pub fn execute_javascript(&self, code: &str, script_url: &str, start_line: i32) {
+        let state = self
+            .browser_host
+            .lock()
+            .expect("browser host mutex poisoned");
+        let Some(browser) = state.browser else {
+            return;
+        };
+
+        unsafe {
+            let Some(get_main_frame) = (*browser.as_ptr()).get_main_frame else {
+                return;
+            };
+            let Some(frame) = NonNull::<cef_frame_t>::new(get_main_frame(browser.as_ptr())) else {
+                return;
+            };
+
+            if let Some(execute_java_script) = (*frame.as_ptr()).execute_java_script {
+                let code = CefOwnedString::new(code);
+                let script_url = CefOwnedString::new(script_url);
+                execute_java_script(frame.as_ptr(), code.as_cef(), script_url.as_cef(), start_line);
+            }
+
+            let _ = base_release(frame.as_ptr().cast::<cef_base_ref_counted_t>());
+        }
     }
 }
 

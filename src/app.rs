@@ -21,6 +21,7 @@ use crate::cef::{
     RawInputSource, run_multi_raw_input_loop, spawn_osr_bridge,
 };
 use crate::config::{AppConfig, WaylandHostMode};
+use crate::desktop_config;
 use crate::frame_bridge::{
     FrameReader, SharedFrameReader, SharedFrameReaderConfig, create_shared_frame_writer,
     default_frame_dump_path, duplicate_fd,
@@ -31,6 +32,7 @@ use crate::ipc::{
     WindowStateSnapshot, build_emit_script, handle_frontend_message, init_script,
 };
 use crate::launcher;
+use crate::language;
 use crate::official_helper::{OfficialHelperConfig, OfficialHelperHandle};
 use crate::shutdown::register_ctrlc_flag;
 use crate::standalone_helper::{
@@ -56,7 +58,11 @@ fn verbose_paint_trace_enabled() -> bool {
 }
 
 fn clamp_cef_frame_rate(frame_rate: u32) -> u32 {
-    frame_rate.clamp(1, 60)
+    let max_frame_rate = std::env::var("NEKO_CEF_MAX_FRAME_RATE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(120);
+    frame_rate.clamp(1, max_frame_rate.max(1))
 }
 
 fn helper_loop_sleep_ms(frame_rate: u32) -> u32 {
@@ -623,7 +629,7 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
     let stop_requested = Arc::new(AtomicBool::new(false));
     register_ctrlc_flag(stop_requested.clone())?;
 
-    let mut launcher_runtime = Some(launcher::start_launcher(&config.repo_root)?);
+    let mut launcher_runtime = Some(launcher::start_launcher(&config)?);
     let frontend_ports = match launcher::wait_for_frontend_url_until(
         launcher_runtime
             .as_ref()
@@ -772,54 +778,67 @@ fn run_raw_only_cef(config: AppConfig) -> Result<()> {
     }
     cef_config.frame_rate = effective_render_fps;
 
-    install_event_callback(|event| match event {
-        CefLifecycleEvent::BrowserCreated => {
-            eprintln!("NEKO_CEF_EVENT browser_created");
-        }
-        CefLifecycleEvent::BrowserBeforeClose => {
-            eprintln!("NEKO_CEF_EVENT browser_before_close");
-        }
-        CefLifecycleEvent::LoadStart { transition_type } => {
-            eprintln!("NEKO_CEF_EVENT load_start transition_type={transition_type}");
-        }
-        CefLifecycleEvent::LoadEnd { http_status_code } => {
-            eprintln!("NEKO_CEF_EVENT load_end http_status_code={http_status_code}");
-        }
-        CefLifecycleEvent::LoadError {
-            error_code,
-            error_text,
-            failed_url,
-        } => {
-            eprintln!(
-                "NEKO_CEF_EVENT load_error error_code={} error_text={:?} failed_url={:?}",
-                error_code, error_text, failed_url
-            );
-        }
-        CefLifecycleEvent::LoadingStateChange {
-            is_loading,
-            can_go_back,
-            can_go_forward,
-        } => {
-            eprintln!(
-                "NEKO_CEF_EVENT loading_state is_loading={} can_go_back={} can_go_forward={}",
-                is_loading, can_go_back, can_go_forward
-            );
-        }
-        CefLifecycleEvent::Console {
-            level,
-            source,
-            line,
-            message,
-        } => {
-            eprintln!(
-                "NEKO_CEF_EVENT console level={} source={:?}:{} message={:?}",
-                level, source, line, message
-            );
-        }
-    });
-
     match spawn_osr_bridge(primary_handle.clone(), cef_config) {
         Ok(bridge) => {
+            let frontend_language_script = build_language_sync_script()?;
+            let bridge_ptr = (&bridge as *const _) as usize;
+            install_event_callback({
+                let frontend_language_script = frontend_language_script.clone();
+                move |event| match event {
+                    CefLifecycleEvent::BrowserCreated => {
+                        eprintln!("NEKO_CEF_EVENT browser_created");
+                    }
+                    CefLifecycleEvent::BrowserBeforeClose => {
+                        eprintln!("NEKO_CEF_EVENT browser_before_close");
+                    }
+                    CefLifecycleEvent::LoadStart { transition_type } => {
+                        eprintln!("NEKO_CEF_EVENT load_start transition_type={transition_type}");
+                    }
+                    CefLifecycleEvent::LoadEnd { http_status_code } => {
+                        eprintln!("NEKO_CEF_EVENT load_end http_status_code={http_status_code}");
+                        if (200..400).contains(&http_status_code) {
+                            unsafe {
+                                (*(bridge_ptr as *const crate::cef::CefOsrBridge)).execute_javascript(
+                                    &frontend_language_script,
+                                    "neko://language-sync",
+                                    1,
+                                );
+                            }
+                        }
+                    }
+                    CefLifecycleEvent::LoadError {
+                        error_code,
+                        error_text,
+                        failed_url,
+                    } => {
+                        eprintln!(
+                            "NEKO_CEF_EVENT load_error error_code={} error_text={:?} failed_url={:?}",
+                            error_code, error_text, failed_url
+                        );
+                    }
+                    CefLifecycleEvent::LoadingStateChange {
+                        is_loading,
+                        can_go_back,
+                        can_go_forward,
+                    } => {
+                        eprintln!(
+                            "NEKO_CEF_EVENT loading_state is_loading={} can_go_back={} can_go_forward={}",
+                            is_loading, can_go_back, can_go_forward
+                        );
+                    }
+                    CefLifecycleEvent::Console {
+                        level,
+                        source,
+                        line,
+                        message,
+                    } => {
+                        eprintln!(
+                            "NEKO_CEF_EVENT console level={} source={:?}:{} message={:?}",
+                            level, source, line, message
+                        );
+                    }
+                }
+            });
             #[cfg(feature = "cef_osr")]
             let loop_mode = format!("{:?}", bridge.message_loop_mode());
             #[cfg(not(feature = "cef_osr"))]
@@ -902,6 +921,43 @@ fn append_query_pairs(url: &str, pairs: &[(&str, &str)]) -> String {
     result
 }
 
+fn build_language_sync_script() -> Result<String> {
+    let i18n_locale = serde_json::to_string(&language::default_i18n_locale())
+        .context("failed to serialize i18n locale for frontend sync script")?;
+    let user_language = serde_json::to_string(&language::default_user_language())
+        .context("failed to serialize user language for frontend sync script")?;
+
+    Ok(format!(
+        r#"(function () {{
+const targetLocale = {i18n_locale};
+const targetUserLanguage = {user_language};
+function applyLanguageSync() {{
+  try {{ localStorage.setItem('i18nextLng', targetLocale); }} catch (_err) {{}}
+  try {{ localStorage.setItem('userLanguage', targetUserLanguage); }} catch (_err) {{}}
+  try {{ document.documentElement.lang = targetLocale; }} catch (_err) {{}}
+  try {{
+    if (window.appState) {{
+      window.appState.userLanguage = targetUserLanguage;
+    }}
+  }} catch (_err) {{}}
+  try {{
+    if (window.i18next && typeof window.i18next.changeLanguage === 'function') {{
+      window.i18next.changeLanguage(targetLocale);
+    }}
+  }} catch (_err) {{}}
+  try {{
+    window.dispatchEvent(new CustomEvent('localechange', {{
+      detail: {{ language: targetLocale, userLanguage: targetUserLanguage }}
+    }}));
+  }} catch (_err) {{}}
+}}
+applyLanguageSync();
+setTimeout(applyLanguageSync, 100);
+setTimeout(applyLanguageSync, 1000);
+}})();"#,
+    ))
+}
+
 fn run_official_helper_probe(config: &AppConfig) -> Result<()> {
     let helper_config = OfficialHelperConfig::discover(&config.repo_root)?;
     eprintln!(
@@ -936,7 +992,7 @@ fn run_official_helper_probe(config: &AppConfig) -> Result<()> {
 }
 
 fn run_official_helper_runtime(config: &AppConfig) -> Result<()> {
-    let launcher_runtime = launcher::start_launcher(&config.repo_root)?;
+    let launcher_runtime = launcher::start_launcher(config)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
     let frontend_url = frontend_ports
         .frontend_url()
@@ -1074,6 +1130,9 @@ fn handle_raw_host_request(
         }),
         HostRequest::SetDarkMode { enabled } => {
             *dark_mode_enabled = enabled;
+            if let Err(err) = desktop_config::persist_dark_mode(enabled) {
+                eprintln!("failed to persist dark mode setting: {err:#}");
+            }
             Some(HostEvent::DarkModeChanged { enabled })
         }
         HostRequest::OpenExternal { url } => match open_external_url(&url) {
@@ -1188,7 +1247,7 @@ fn run_c_standalone_probe(
     profile: &WaylandProfile,
     strategy: &StrategySelection,
 ) -> Result<()> {
-    let launcher_runtime = launcher::start_launcher(&config.repo_root)?;
+    let launcher_runtime = launcher::start_launcher(config)?;
     let frontend_ports = launcher::wait_for_frontend_url(&launcher_runtime)?;
     let frontend_url = frontend_ports
         .frontend_url()
@@ -1309,9 +1368,10 @@ fn run_c_standalone_probe(
     let helper_event_wait = Duration::from_millis(helper_event_wait_ms(config.render_fps));
     let mut helper_shutdown_started = false;
     let mut helper_shutdown_deadline = None::<Instant>;
-    let mut dark_mode_enabled = false;
+    let mut dark_mode_enabled = config.dark_mode;
     let mut raw_cef_host_bridge_installed = false;
     let raw_cef_host_init_script = build_raw_cef_init_script();
+    let frontend_language_script = build_language_sync_script()?;
     let mut last_raw_screen_script = None::<String>;
     let mut last_raw_window_script = None::<String>;
 
@@ -1375,6 +1435,7 @@ fn run_c_standalone_probe(
             match event {
                 CStandaloneHelperEvent::LoadEnd { http_status_code } => {
                     if http_status_code >= 200 && http_status_code < 400 && !raw_cef_host_bridge_installed {
+                        helper.send_eval_script(&frontend_language_script)?;
                         helper.send_eval_script(&raw_cef_host_init_script)?;
                         raw_cef_host_bridge_installed = true;
 
